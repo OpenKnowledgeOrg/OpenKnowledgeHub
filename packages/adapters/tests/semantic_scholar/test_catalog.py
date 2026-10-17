@@ -212,3 +212,17 @@ async def test_retry_after_is_capped(client: SemanticScholar, s2: FakeS2, clock:
     s2.fail_next = [httpx.Response(429, headers={"retry-after": "86400"})]
     await client.catalog.resolve_release("latest")
     assert clock.sleeps == [120.0]
+
+
+async def test_release_listing_validates_ids_and_preserves_source_errors(
+    client: SemanticScholar,
+    s2: FakeS2,
+) -> None:
+    assert await client.catalog.list_releases() == tuple(s2.releases)
+    assert s2.keys_sent == [None]
+    s2.fail_next = [httpx.Response(200, json=["malformed"])]
+    with pytest.raises(SourceRejected, match="malformed release IDs"):
+        await client.catalog.list_releases()
+    s2.fail_next = [httpx.Response(403)]
+    with pytest.raises(SourceRejected):
+        await client.catalog.list_releases()

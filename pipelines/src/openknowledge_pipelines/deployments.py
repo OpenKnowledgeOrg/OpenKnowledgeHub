@@ -7,7 +7,9 @@ from contextlib import AbstractAsyncContextManager
 from prefect import flow
 from prefect import serve as prefect_serve
 from prefect.client.orchestration import get_client
-from prefect.client.schemas.actions import GlobalConcurrencyLimitCreate
+from prefect.client.schemas.actions import DeploymentScheduleCreate, GlobalConcurrencyLimitCreate
+from prefect.client.schemas.objects import ConcurrencyLimitConfig, ConcurrencyLimitStrategy
+from prefect.client.schemas.schedules import CronSchedule
 from prefect.concurrency.asyncio import concurrency
 from prefect.deployments.runner import RunnerDeployment
 from prefect.exceptions import ObjectNotFound
@@ -24,9 +26,18 @@ from openknowledge_core.ingestion import (
     LoadDiffResult,
     WatchdogResult,
 )
+from openknowledge_core.ingestion.coordinator import SyncResult
+from openknowledge_core.ingestion.errors import IngestionError
 from openknowledge_core.ingestion.families import ArchiveFamily, require_family
 from openknowledge_pipelines import bootstrap
-from openknowledge_pipelines.settings import BatchSettings, LoadSettings, WatchdogSettings
+from openknowledge_pipelines.flows.s2_sync import run_sync
+from openknowledge_pipelines.settings import (
+    BatchSettings,
+    LoadSettings,
+    ScheduleSettings,
+    SyncSettings,
+    WatchdogSettings,
+)
 
 DEPLOYMENT = "control-vm"
 # Keep the existing process budget. Busy downloads fail acquisition promptly to release slots
@@ -74,18 +85,44 @@ async def _download(command: DownloadDataset, family: ArchiveFamily) -> BatchDow
     require_family(command.dataset, family)
     settings = BatchSettings()  # pyright: ignore[reportCallIssue]
     async with one_s2_user(), bootstrap.open_batch_download(settings) as (service, jobs):
-        return await bootstrap.batch_download_flows(service, jobs, settings, family).dataset.fn(
+        result = await bootstrap.batch_download_flows(service, jobs, settings, family).dataset.fn(
             command
         )
+        if family != ArchiveFamily.CORE:
+            async with bootstrap.open_archive_progress(settings) as progress:
+                await progress.finalize(command)
+        return result
 
 
 async def _download_diff(command: DownloadDiff, family: ArchiveFamily) -> BatchDiffDownloadResult:
     require_family(command.dataset, family)
     settings = BatchSettings()  # pyright: ignore[reportCallIssue]
-    async with one_s2_user(), bootstrap.open_batch_download(settings) as (service, jobs):
-        return await bootstrap.batch_download_flows(service, jobs, settings, family).diff.fn(
-            command
-        )
+    async with one_s2_user():
+        predecessor = None
+        if family != ArchiveFamily.CORE:
+            baseline = settings.sync.archives.get(command.dataset) if settings.sync else None
+            if baseline is None:
+                raise IngestionError("manual archive diff requires OKP_SYNC archive baseline")
+            if (baseline.base.dataset, baseline.base.bucket, baseline.base.prefix) != (
+                command.dataset,
+                command.bucket,
+                command.prefix,
+            ):
+                raise IngestionError("manual diff baseline identifies another dataset/location")
+            async with bootstrap.open_archive_progress(settings) as progress:
+                predecessor, completed = await progress.manual_diff(
+                    baseline.base, baseline.completion, command
+                )
+                if completed is not None:
+                    return completed
+        async with bootstrap.open_batch_download(settings) as (service, jobs):
+            result = await bootstrap.batch_download_flows(service, jobs, settings, family).diff.fn(
+                command
+            )
+        if family != ArchiveFamily.CORE:
+            async with bootstrap.open_archive_progress(settings) as progress:
+                await progress.finalize(command, predecessor)
+        return result
 
 
 @flow(name="s2-batch-download", persist_result=False)
@@ -118,6 +155,34 @@ async def s2_batch_download_embeddings_diff(command: DownloadDiff) -> BatchDiffD
     return await _download_diff(command, ArchiveFamily.EMBEDDINGS)
 
 
+@flow(name="s2-sync", persist_result=False, retries=0)
+async def s2_sync() -> SyncResult:
+    settings = SyncSettings()  # pyright: ignore[reportCallIssue]
+    if settings.sync is None:
+        raise IngestionError("OKP_SYNC must configure the coordinator bucket and baselines")
+    async with bootstrap.open_sync(settings, one_s2_user, one_clickhouse_loader) as services:
+        return await run_sync(settings.sync, services)
+
+
+def sync_deployment() -> RunnerDeployment:
+    settings = ScheduleSettings()
+    return RunnerDeployment.from_flow(
+        s2_sync,
+        DEPLOYMENT,
+        entrypoint_type=EntrypointType.MODULE_PATH,
+        schedules=[
+            DeploymentScheduleCreate(
+                schedule=CronSchedule(cron="30 1 * * *", timezone="Europe/Zurich"),
+                active=settings.sync_schedule_enabled,
+            )
+        ],
+        concurrency_limit=ConcurrencyLimitConfig(
+            limit=1,
+            collision_strategy=ConcurrencyLimitStrategy.CANCEL_NEW,
+        ),
+    )
+
+
 @flow(name="watchdog", persist_result=False)
 async def watchdog() -> WatchdogResult:
     settings = WatchdogSettings()  # pyright: ignore[reportCallIssue]
@@ -140,6 +205,7 @@ def ensure_limits() -> None:
 def serve() -> None:
     ensure_limits()
     prefect_serve(
+        sync_deployment(),
         # One run of each load at a time, held in Prefect's queue, so a second run of the same load
         # holds no serve slot. LOAD_LIMIT keeps the two deployments apart, so no two served loads
         # hit ClickHouse at once; a load waiting on it does hold a slot.

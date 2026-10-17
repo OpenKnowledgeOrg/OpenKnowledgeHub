@@ -189,6 +189,73 @@ def archive_specter2(release: str, from_release: str | None, bucket: str, prefix
     _archive_dataset("embeddings-specter_v2", release, from_release, bucket, prefix)
 
 
+@s2.command(
+    "adopt-archive-base", help="Validate an existing base and create its immutable completion."
+)
+@click.option("--dataset", required=True)
+@click.option("--release", required=True)
+@click.option("--bucket", required=True)
+@click.option("--prefix", default="semantic-scholar", show_default=True)
+def adopt_archive_base(dataset: str, release: str, bucket: str, prefix: str) -> None:
+    command = _command(
+        DownloadDataset,
+        OPTION_RULES,
+        dataset=dataset,
+        release=release,
+        bucket=bucket,
+        prefix=prefix,
+    )
+    if archive_family(dataset) == ArchiveFamily.CORE:
+        raise click.UsageError("core progress uses applied releases")
+    settings = _settings(PipelineSettings)
+
+    async def run() -> BaseModel:
+        async with bootstrap.open_archive_progress(settings) as progress:
+            return await progress.finalize(command)
+
+    _run(run)
+
+
+@s2.command(
+    "verify-base-manifest",
+    help="Validate a completed base and print its pinned manifest reference.",
+)
+@click.option("--dataset", required=True)
+@click.option("--release", required=True)
+@click.option("--bucket", required=True)
+@click.option("--prefix", default="semantic-scholar", show_default=True)
+def verify_base_manifest(dataset: str, release: str, bucket: str, prefix: str) -> None:
+    command = _command(
+        DownloadDataset,
+        OPTION_RULES,
+        dataset=dataset,
+        release=release,
+        bucket=bucket,
+        prefix=prefix,
+    )
+    settings = _settings(PipelineSettings)
+
+    async def run() -> BaseModel:
+        from openknowledge_core.ingestion.models import dataset_file_path
+
+        async with bootstrap.open_archive_progress(settings) as progress:
+            path = dataset_file_path(
+                command.bucket, command.prefix, command.release, command.dataset, "manifest.json"
+            )
+            reference = await progress.reference(path)
+            await progress.baseline_manifest(reference, dataset, bucket, prefix)
+            return reference
+
+    _run(run)
+
+
+@s2.command("sync", help="Run one coordinator cycle using OKP_SYNC configuration.")
+def sync() -> None:
+    from openknowledge_pipelines import deployments
+
+    _run(deployments.s2_sync)
+
+
 @s2.command("download-shard", help=DOWNLOAD_SHARD_HELP, short_help=DOWNLOAD_SHARD_HELP)
 @click.option("--release", required=True, help=RELEASE_HELP)
 @click.option("--dataset", required=True, help=DATASET_HELP)

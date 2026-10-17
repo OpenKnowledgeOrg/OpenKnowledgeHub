@@ -187,6 +187,7 @@ def test_serve_offers_the_load_flow_by_module_path(monkeypatch: pytest.MonkeyPat
     result = CliRunner().invoke(cli.main, ["serve"])
     assert result.exit_code == 0, result.output
     assert [load_flow_from_entrypoint(str(found.entrypoint)) for found in served] == [
+        deployments.s2_sync,
         deployments.s2_load,
         deployments.s2_load_diff,
         deployments.s2_batch_download,
@@ -197,8 +198,8 @@ def test_serve_offers_the_load_flow_by_module_path(monkeypatch: pytest.MonkeyPat
         deployments.s2_batch_download_embeddings_diff,
         deployments.watchdog,
     ]
-    assert [found.concurrency_limit for found in served] == [1] * 8 + [None]
-    *unscheduled, watchdog = served
+    assert [found.concurrency_limit for found in served] == [1] * 9 + [None]
+    _coordinator, *unscheduled, watchdog = served
     assert [found.schedules for found in unscheduled] == [[]] * 8
     [scheduled] = cast("list[DeploymentScheduleCreate]", watchdog.schedules)
     assert isinstance(scheduled.schedule, CronSchedule)

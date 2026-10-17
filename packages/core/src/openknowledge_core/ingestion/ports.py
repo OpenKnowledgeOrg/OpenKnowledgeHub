@@ -26,6 +26,8 @@ from openknowledge_core.ingestion.models import (
 
 
 class ReleaseCatalog(Protocol):
+    async def list_releases(self) -> tuple[ReleaseId, ...]: ...
+
     async def resolve_release(self, selector: ReleaseId | Literal["latest"]) -> ReleaseMetadata:
         """Resolves ``latest`` to the explicit release id it stands for."""
         ...
@@ -48,6 +50,10 @@ class ShardDownloader(Protocol):
 
 
 class ArtifactStore(Protocol):
+    async def list_objects(self, prefix: ObjectPath) -> tuple[StoredObject, ...]:
+        """List all objects under a scoped prefix, following every page."""
+        ...
+
     async def stat(self, path: ObjectPath) -> StoredObject | None: ...
 
     async def create(

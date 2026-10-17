@@ -10,7 +10,6 @@ from prefect.settings import PREFECT_RESULTS_LOCAL_STORAGE_PATH, temporary_setti
 from openknowledge_contracts.manifests import DatasetManifest
 from openknowledge_core.ingestion import (
     DownloadDatasetService,
-    DownloadShard,
     JobOutcome,
     LoadDataset,
     LoadDatasetService,
@@ -37,6 +36,7 @@ from tests.fakes.ports import (
     PRODUCER,
     RELEASE,
     FakeApplied,
+    FakeJobs,
     FakeSource,
     FakeStore,
     FakeTables,
@@ -134,58 +134,6 @@ async def test_only_transient_load_errors_are_retried(
     with pytest.raises(ContractViolation):
         await load_flow(store, tables)(LOAD)
     assert tables.loads == ["part-0.gz", "part-0.gz"]
-
-
-class FakeJobs:
-    """Archives a job's shards in this process, failing each shard in ``failing`` once."""
-
-    def __init__(self, service: DownloadDatasetService, failing: set[int]) -> None:
-        self.service = service
-        self.failing = failing
-        self.submitted: list[tuple[int, ...]] = []
-        self.jobs: list[ShardJob] = []
-        self.parts: list[str | None] = []
-        self.outcomes: dict[str, JobOutcome] = {}
-        self.left: dict[str, bool] = {}
-        self.deleted: list[str] = []
-        self.waited: list[str] = []
-
-    async def running(self, family: ArchiveFamily = ArchiveFamily.CORE) -> dict[str, bool]:
-        self.family = family
-        left, self.left = self.left, {}
-        return left
-
-    async def delete(self, name: str) -> None:
-        self.deleted.append(name)
-
-    async def submit(self, job: ShardJob) -> str:
-        self.jobs.append(job)
-        self.submitted.append(job.shards)
-        self.parts.append(job.part)
-        outcome = JobOutcome.SUCCEEDED
-        for index in job.shards:
-            if index in self.failing:
-                self.failing.discard(index)
-                outcome = JobOutcome.FAILED
-                continue
-            await self.service.archive_shard_at(
-                DownloadShard(
-                    release=job.release_id,
-                    dataset=job.dataset,
-                    shard=index,
-                    bucket=job.bucket,
-                    prefix=job.prefix,
-                    from_release=job.from_release,
-                    part=job.part,
-                )
-            )
-        name = f"job-{len(self.submitted)}"
-        self.outcomes[name] = outcome
-        return name
-
-    async def wait(self, name: str) -> JobOutcome:
-        self.waited.append(name)
-        return self.outcomes[name]
 
 
 async def test_batch_rounds_run_only_unfinished_shards(

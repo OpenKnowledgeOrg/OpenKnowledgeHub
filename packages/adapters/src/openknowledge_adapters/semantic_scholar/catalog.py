@@ -8,7 +8,7 @@ from typing import Literal
 from urllib.parse import quote, urlsplit
 
 import httpx
-from pydantic import BaseModel, ConfigDict, SecretStr, ValidationError
+from pydantic import BaseModel, ConfigDict, SecretStr, TypeAdapter, ValidationError
 
 from openknowledge_adapters.semantic_scholar.rate_limit import AsyncRateLimiter
 from openknowledge_contracts.datasets import (
@@ -81,6 +81,13 @@ class SemanticScholarCatalog:
         self._backoff = backoff
         self._sleep = sleep
         self._uniform = uniform
+
+    async def list_releases(self) -> tuple[ReleaseId, ...]:
+        body = await self._get("release", "available releases", authenticated=False)
+        try:
+            return TypeAdapter(tuple[ReleaseId, ...]).validate_python(body)
+        except ValidationError:
+            raise SourceRejected("Semantic Scholar sent malformed release IDs") from None
 
     async def resolve_release(self, selector: ReleaseId | Literal["latest"]) -> ReleaseMetadata:
         about = f"release {selector}"

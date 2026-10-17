@@ -14,6 +14,7 @@ from pydantic import (
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from openknowledge_contracts.manifests import BucketName, ImageDigest
+from openknowledge_core.ingestion.coordinator import SyncCommand
 from openknowledge_core.ingestion.models import ApiKey
 
 
@@ -61,6 +62,8 @@ class WatchdogSettings(LoadSettings):
 
 
 class BatchSettings(PipelineSettings):
+    sync: SyncCommand | None = None
+
     image_digest: ImageDigest  # pyright: ignore[reportIncompatibleVariableOverride, reportGeneralTypeIssues]
     """Batch tasks run the image at this digest."""
     batch_project: str
@@ -77,3 +80,11 @@ class BatchSettings(PipelineSettings):
     batch_max_run_seconds: PositiveInt = 6 * 60 * 60
     batch_poll_seconds: PositiveFloat = 30.0
     batch_wait_timeout_seconds: PositiveFloat = 24 * 60 * 60
+
+
+class SyncSettings(BatchSettings, LoadSettings):  # pyright: ignore[reportIncompatibleVariableOverride]
+    pass
+
+
+class ScheduleSettings(CommonSettings):
+    sync_schedule_enabled: bool = False

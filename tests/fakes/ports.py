@@ -15,7 +15,7 @@ from pydantic import SecretStr
 from openknowledge_contracts.datasets import DatasetSummary, ReleaseMetadata, ShardRef
 from openknowledge_contracts.manifests import ObjectPath, ObjectRef, Producer
 from openknowledge_contracts.tables.contract import UpdateMode
-from openknowledge_core.ingestion.commands import DownloadDataset, DownloadDiff
+from openknowledge_core.ingestion.commands import DownloadDataset, DownloadDiff, DownloadShard
 from openknowledge_core.ingestion.errors import (
     IncompleteTransfer,
     IngestionError,
@@ -23,6 +23,7 @@ from openknowledge_core.ingestion.errors import (
     ObjectChanged,
     SourceUnavailable,
 )
+from openknowledge_core.ingestion.families import ArchiveFamily
 from openknowledge_core.ingestion.models import (
     AppliedRelease,
     ByteStream,
@@ -31,13 +32,16 @@ from openknowledge_core.ingestion.models import (
     DiffChain,
     DiffListing,
     Duplicates,
+    JobOutcome,
     LoadObject,
     LoadRecord,
     Operation,
+    ShardJob,
     ShardLink,
     StoredObject,
     TableState,
 )
+from openknowledge_core.ingestion.service import DownloadDatasetService
 from tests.fakes.checksums import crc32c_b64, md5_b64
 
 RELEASE = "2026-10-06"
@@ -116,6 +120,9 @@ class FakeSource:
             for name, data in files.items():
                 self.diff_files[diff_ref(part, old, new, dataset, name).source_path] = data
         self.diffs.setdefault(dataset, []).append((old, new, list(updates), list(deletes)))
+
+    async def list_releases(self) -> tuple[str, ...]:
+        return tuple(self.releases)
 
     async def resolve_release(self, selector: str | Literal["latest"]) -> ReleaseMetadata:
         self.resolved.append(selector)
@@ -257,6 +264,13 @@ class FakeStore:
             crc32c=self.crc32c_override.get(str(path), crc32c_b64(stored.data)),
         )
 
+    async def list_objects(self, prefix: ObjectPath) -> tuple[StoredObject, ...]:
+        return tuple(
+            self._stored(ObjectPath(bucket=prefix.bucket, name=key.split("/", 3)[3]))
+            for key in self.objects
+            if key.startswith(str(prefix) + "/")
+        )
+
     async def stat(self, path: ObjectPath) -> StoredObject | None:
         return self._stored(path) if str(path) in self.objects else None
 
@@ -374,3 +388,55 @@ class FakeApplied:
 
     async def latest(self, target: str) -> AppliedRelease | None:
         return next((found for found in reversed(self.records) if found.target == target), None)
+
+
+class FakeJobs:
+    """Archives a job's shards in this process, failing each shard in ``failing`` once."""
+
+    def __init__(self, service: DownloadDatasetService, failing: set[int]) -> None:
+        self.service = service
+        self.failing = failing
+        self.submitted: list[tuple[int, ...]] = []
+        self.jobs: list[ShardJob] = []
+        self.parts: list[str | None] = []
+        self.outcomes: dict[str, JobOutcome] = {}
+        self.left: dict[str, bool] = {}
+        self.deleted: list[str] = []
+        self.waited: list[str] = []
+
+    async def running(self, family: ArchiveFamily = ArchiveFamily.CORE) -> dict[str, bool]:
+        self.family = family
+        left, self.left = self.left, {}
+        return left
+
+    async def delete(self, name: str) -> None:
+        self.deleted.append(name)
+
+    async def submit(self, job: ShardJob) -> str:
+        self.jobs.append(job)
+        self.submitted.append(job.shards)
+        self.parts.append(job.part)
+        outcome = JobOutcome.SUCCEEDED
+        for index in job.shards:
+            if index in self.failing:
+                self.failing.discard(index)
+                outcome = JobOutcome.FAILED
+                continue
+            await self.service.archive_shard_at(
+                DownloadShard(
+                    release=job.release_id,
+                    dataset=job.dataset,
+                    shard=index,
+                    bucket=job.bucket,
+                    prefix=job.prefix,
+                    from_release=job.from_release,
+                    part=job.part,
+                )
+            )
+        name = f"job-{len(self.submitted)}"
+        self.outcomes[name] = outcome
+        return name
+
+    async def wait(self, name: str) -> JobOutcome:
+        self.waited.append(name)
+        return self.outcomes[name]
