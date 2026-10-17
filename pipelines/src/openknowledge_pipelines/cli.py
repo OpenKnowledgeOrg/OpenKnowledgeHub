@@ -11,6 +11,7 @@ from pydantic import BaseModel, ValidationError
 
 from openknowledge_core.ingestion import (
     DownloadDataset,
+    DownloadDiff,
     DownloadShard,
     IngestionError,
     LoadDataset,
@@ -19,6 +20,7 @@ from openknowledge_core.ingestion import (
     LoadDiffResult,
     PinRelease,
 )
+from openknowledge_core.ingestion.families import ArchiveFamily, archive_family
 from openknowledge_pipelines import bootstrap
 from openknowledge_pipelines.settings import (
     BatchSettings,
@@ -122,6 +124,69 @@ def download(release: str, dataset: str, bucket: str, prefix: str) -> None:
             return await bootstrap.download_flow(service, settings)(command)
 
     _run(run)
+
+
+def _archive(command: DownloadDataset | DownloadDiff) -> None:
+    try:
+        family = archive_family(command.dataset)
+    except ValueError as exc:
+        raise click.UsageError(str(exc)) from None
+    _settings(BatchSettings)
+    from openknowledge_pipelines import deployments
+
+    async def run() -> BaseModel:
+        if isinstance(command, DownloadDiff):
+            diff_routes = {
+                ArchiveFamily.CORE: deployments.s2_batch_download_diff,
+                ArchiveFamily.FULLTEXT: deployments.s2_batch_download_fulltext_diff,
+                ArchiveFamily.EMBEDDINGS: deployments.s2_batch_download_embeddings_diff,
+            }
+            return await diff_routes[family](command)
+        routes = {
+            ArchiveFamily.CORE: deployments.s2_batch_download,
+            ArchiveFamily.FULLTEXT: deployments.s2_batch_download_fulltext,
+            ArchiveFamily.EMBEDDINGS: deployments.s2_batch_download_embeddings,
+        }
+        return await routes[family](command)
+
+    _run(run)
+
+
+def _archive_options(function: Callable[..., None]) -> Callable[..., None]:
+    for option in (
+        click.option("--release", required=True, help=RELEASE_HELP),
+        click.option("--from-release", help="Archive this explicit diff instead of a base."),
+        click.option("--bucket", required=True),
+        click.option("--prefix", default="semantic-scholar", show_default=True),
+    ):
+        function = option(function)
+    return function
+
+
+def _archive_dataset(
+    dataset: str, release: str, from_release: str | None, bucket: str, prefix: str
+) -> None:
+    values = dict(release=release, dataset=dataset, bucket=bucket, prefix=prefix)
+    command = (
+        _command(DownloadDiff, OPTION_RULES, from_release=from_release, **values)
+        if from_release is not None
+        else _command(DownloadDataset, OPTION_RULES, **values)
+    )
+    _archive(command)
+
+
+@s2.command("archive-fulltext", help="Archive s2orc_v2 base or explicit diff through Batch.")
+@_archive_options
+def archive_fulltext(release: str, from_release: str | None, bucket: str, prefix: str) -> None:
+    _archive_dataset("s2orc_v2", release, from_release, bucket, prefix)
+
+
+@s2.command(
+    "archive-specter2", help="Archive embeddings-specter_v2 base or explicit diff through Batch."
+)
+@_archive_options
+def archive_specter2(release: str, from_release: str | None, bucket: str, prefix: str) -> None:
+    _archive_dataset("embeddings-specter_v2", release, from_release, bucket, prefix)
 
 
 @s2.command("download-shard", help=DOWNLOAD_SHARD_HELP, short_help=DOWNLOAD_SHARD_HELP)

@@ -16,6 +16,7 @@ from openknowledge_core.ingestion.errors import (
     BatchTimedOut,
     BatchUnavailable,
 )
+from openknowledge_core.ingestion.families import ArchiveFamily, archive_family
 from openknowledge_core.ingestion.models import JobOutcome, ShardJob
 
 ENDED = {
@@ -69,8 +70,8 @@ class CloudBatchJobs:
             ) from None
         return name
 
-    async def running(self) -> dict[str, bool]:
-        """Download jobs, told apart from other Batch jobs by their operation-id label."""
+    async def running(self, family: ArchiveFamily = ArchiveFamily.CORE) -> dict[str, bool]:
+        """Inspect all pages before allowing family cleanup or a new submission."""
         found: dict[str, bool] = {}
         params: dict[str, str] = {}
         while True:
@@ -78,6 +79,13 @@ class CloudBatchJobs:
             for job in body.get("jobs", []):
                 state = job.get("status", {}).get("state")
                 if "operation-id" in job.get("labels", {}) and state not in ENDED:
+                    labels = job["labels"]
+                    if labels.get("archive-family") != family.value:
+                        raise BatchRejected(
+                            f"Active foreign or legacy download job {job['name']}; "
+                            "drain it to a terminal state before retrying. "
+                            "This lookup did not cancel or wait on jobs"
+                        )
                     found[str(job["name"])] = state in QUEUED
             if not body.get("nextPageToken"):
                 return found
@@ -104,7 +112,8 @@ class CloudBatchJobs:
             raise BatchTimedOut(
                 f"Cloud Batch job {name} did not finish within "
                 f"{self._config.wait_timeout_seconds:g}s and may still be running; "
-                "later downloads wait for it once it has started, so cancel it if it hangs"
+                "same-family downloads wait for it once started; other families refuse to start. "
+                "Inspect and drain it if it hangs"
             ) from None
 
     async def _call(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:  # noqa: ANN401
@@ -176,6 +185,7 @@ def job_spec(config: BatchConfig, job: ShardJob) -> dict[str, Any]:
             },
         },
         "labels": {
+            "archive-family": archive_family(job.dataset).value,
             "dataset": job.dataset.replace("_", "-"),
             "release": job.release_id,
             "part": job.part or "base",

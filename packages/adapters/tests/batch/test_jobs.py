@@ -9,7 +9,9 @@ from gcloud.aio.auth import Token
 
 from openknowledge_adapters import batch
 from openknowledge_adapters.batch.jobs import job_id, job_spec
+from openknowledge_contracts.datasets import DiffPart
 from openknowledge_core.ingestion.errors import BatchRejected, BatchTimedOut, BatchUnavailable
+from openknowledge_core.ingestion.families import ArchiveFamily
 from openknowledge_core.ingestion.models import JobOutcome, ShardJob
 
 PARENT = "projects/p/locations/europe-west4"
@@ -123,9 +125,14 @@ async def test_running_names_download_jobs_that_have_not_ended_on_every_page() -
     def job(name: str, state: str, labels: dict[str, str]) -> dict[str, Any]:
         return {"name": name, "labels": labels, "status": {"state": state}}
 
-    download = {"operation-id": "1"}
+    download = {"operation-id": "1", "archive-family": "core"}
     pages = [
-        [job("a", "RUNNING", download), job("b", "SUCCEEDED", download)],
+        [
+            job("a", "RUNNING", download),
+            job("b", "SUCCEEDED", download),
+            job("legacy", "SUCCEEDED", {"operation-id": "old"}),
+            job("foreign", "FAILED", {"operation-id": "f", "archive-family": "embeddings"}),
+        ],
         [job("c", "RUNNING", {}), job("d", "QUEUED", download)],
     ]
     async with (
@@ -201,3 +208,57 @@ async def test_a_lost_create_reply_resumes_exactly_one_remote_job(replay: bool) 
         assert await jobs.submit(JOB) == f"{PARENT}/jobs/{job_id(JOB)}"
     assert len(remote) == 1
     assert posted == [{"jobId": job_id(JOB), "requestId": str(JOB.operation_id)}] * 2
+
+
+@pytest.mark.parametrize(
+    "family,foreign,state",
+    [
+        ("core", "fulltext", "QUEUED"),
+        ("fulltext", "embeddings", "RUNNING"),
+        ("embeddings", None, "QUEUED"),
+        ("fulltext", None, "RUNNING"),
+    ],
+)
+async def test_foreign_or_legacy_jobs_refuse_cleanup_across_pages(
+    family: str, foreign: str | None, state: str
+) -> None:
+    own = {"operation-id": "own", "archive-family": family}
+    labels = {"operation-id": "other"}
+    if foreign is not None:
+        labels["archive-family"] = foreign
+    pages = [
+        [{"name": "own", "labels": own, "status": {"state": "QUEUED"}}],
+        [{"name": "other", "labels": labels, "status": {"state": state}}],
+    ]
+    async with (
+        batch_api(web.json_response({}), [], pages) as (root, posted),
+        batch.connect(CONFIG, api_root=root, token=cast(Token, FakeToken())) as jobs,
+    ):
+        with pytest.raises(BatchRejected, match="drain it to a terminal state"):
+            await jobs.running(ArchiveFamily(family))
+        assert posted == []
+
+
+@pytest.mark.parametrize(
+    "dataset,family,part",
+    [
+        ("papers", "core", None),
+        ("s2orc_v2", "fulltext", "updates"),
+        ("embeddings-specter_v2", "embeddings", "deletes"),
+    ],
+)
+def test_base_and_diff_labels_and_task_budget(
+    dataset: str, family: str, part: DiffPart | None
+) -> None:
+    job = ShardJob(
+        release_id="2026-10-13",
+        dataset=dataset,
+        bucket="raw",
+        prefix="s2",
+        shards=tuple(range(20)),
+        from_release="2026-10-06" if part else None,
+        part=part,
+    )
+    spec = job_spec(CONFIG, job)
+    assert spec["labels"]["archive-family"] == family
+    assert spec["taskGroups"][0]["parallelism"] == 8

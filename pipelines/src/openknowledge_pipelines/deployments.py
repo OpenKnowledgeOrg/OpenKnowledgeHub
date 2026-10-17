@@ -24,13 +24,13 @@ from openknowledge_core.ingestion import (
     LoadDiffResult,
     WatchdogResult,
 )
+from openknowledge_core.ingestion.families import ArchiveFamily, require_family
 from openknowledge_pipelines import bootstrap
 from openknowledge_pipelines.settings import BatchSettings, LoadSettings, WatchdogSettings
 
 DEPLOYMENT = "control-vm"
-# One load, one download and the watchdog at once. The two global limits below hold the loads and
-# the downloads to one each, so this cap no longer guards ClickHouse or the S2 key; a run waiting
-# on a limit still holds a slot, so three runs started by hand delay the watchdog's cron run.
+# Keep the existing process budget. Busy downloads fail acquisition promptly to release slots
+# for loads and the watchdog; deployment queues alone do not reserve runner capacity.
 RUNS_AT_ONCE = 3
 S2_LIMIT = "semantic-scholar"
 LOAD_LIMIT = "clickhouse"
@@ -38,14 +38,20 @@ WATCHDOG_CRON = "0 */6 * * *"
 
 
 def one_s2_user() -> AbstractAsyncContextManager[None]:
-    # Strict, since Prefect skips a missing limit silently. A failed lease renewal must not
-    # cancel a run waiting on its Batch job; the next run waits for that job anyway.
-    return concurrency(S2_LIMIT, strict=True, raise_on_lease_renewal_failure=False)
+    # No per-family limits: the key and Batch task ceiling are shared. On lease loss, stop
+    # submitting work. A later controller must inspect orphaned jobs before submitting.
+    return concurrency(
+        S2_LIMIT,
+        strict=True,
+        timeout_seconds=1,
+        max_retries=0,
+        raise_on_lease_renewal_failure=True,
+    )
 
 
 def one_clickhouse_loader() -> AbstractAsyncContextManager[None]:
-    # Strict for the same reason. A failed lease renewal must not cancel a load in the middle of
-    # an insert of hours.
+    # A missing limit must fail. Keep a load running through a failed renewal so an insert
+    # of hours is not interrupted.
     return concurrency(LOAD_LIMIT, strict=True, raise_on_lease_renewal_failure=False)
 
 
@@ -64,18 +70,52 @@ async def s2_load_diff(command: LoadDiff) -> LoadDiffResult:
         return await bootstrap.load_flows(service, settings).diff.fn(command)
 
 
-@flow(name="s2-batch-download", persist_result=False)
-async def s2_batch_download(command: DownloadDataset) -> BatchDownloadResult:
+async def _download(command: DownloadDataset, family: ArchiveFamily) -> BatchDownloadResult:
+    require_family(command.dataset, family)
     settings = BatchSettings()  # pyright: ignore[reportCallIssue]
     async with one_s2_user(), bootstrap.open_batch_download(settings) as (service, jobs):
-        return await bootstrap.batch_download_flows(service, jobs, settings).dataset.fn(command)
+        return await bootstrap.batch_download_flows(service, jobs, settings, family).dataset.fn(
+            command
+        )
+
+
+async def _download_diff(command: DownloadDiff, family: ArchiveFamily) -> BatchDiffDownloadResult:
+    require_family(command.dataset, family)
+    settings = BatchSettings()  # pyright: ignore[reportCallIssue]
+    async with one_s2_user(), bootstrap.open_batch_download(settings) as (service, jobs):
+        return await bootstrap.batch_download_flows(service, jobs, settings, family).diff.fn(
+            command
+        )
+
+
+@flow(name="s2-batch-download", persist_result=False)
+async def s2_batch_download(command: DownloadDataset) -> BatchDownloadResult:
+    return await _download(command, ArchiveFamily.CORE)
 
 
 @flow(name="s2-batch-download-diff", persist_result=False)
 async def s2_batch_download_diff(command: DownloadDiff) -> BatchDiffDownloadResult:
-    settings = BatchSettings()  # pyright: ignore[reportCallIssue]
-    async with one_s2_user(), bootstrap.open_batch_download(settings) as (service, jobs):
-        return await bootstrap.batch_download_flows(service, jobs, settings).diff.fn(command)
+    return await _download_diff(command, ArchiveFamily.CORE)
+
+
+@flow(name="s2-batch-download-fulltext", persist_result=False)
+async def s2_batch_download_fulltext(command: DownloadDataset) -> BatchDownloadResult:
+    return await _download(command, ArchiveFamily.FULLTEXT)
+
+
+@flow(name="s2-batch-download-fulltext-diff", persist_result=False)
+async def s2_batch_download_fulltext_diff(command: DownloadDiff) -> BatchDiffDownloadResult:
+    return await _download_diff(command, ArchiveFamily.FULLTEXT)
+
+
+@flow(name="s2-batch-download-embeddings", persist_result=False)
+async def s2_batch_download_embeddings(command: DownloadDataset) -> BatchDownloadResult:
+    return await _download(command, ArchiveFamily.EMBEDDINGS)
+
+
+@flow(name="s2-batch-download-embeddings-diff", persist_result=False)
+async def s2_batch_download_embeddings_diff(command: DownloadDiff) -> BatchDiffDownloadResult:
+    return await _download_diff(command, ArchiveFamily.EMBEDDINGS)
 
 
 @flow(name="watchdog", persist_result=False)
@@ -115,8 +155,8 @@ def serve() -> None:
             entrypoint_type=EntrypointType.MODULE_PATH,
             concurrency_limit=1,
         ),
-        # One run of each download at a time, held in Prefect's queue; S2_LIMIT keeps the two
-        # deployments apart, since their tasks share the S2 key's one request per second.
+        # Each download deployment queues its own runs. All six compete for S2_LIMIT; busy
+        # runs fail promptly so they do not occupy runner slots while waiting globally.
         *(
             RunnerDeployment.from_flow(
                 download,
@@ -124,7 +164,14 @@ def serve() -> None:
                 entrypoint_type=EntrypointType.MODULE_PATH,
                 concurrency_limit=1,
             )
-            for download in (s2_batch_download, s2_batch_download_diff)
+            for download in (
+                s2_batch_download,
+                s2_batch_download_diff,
+                s2_batch_download_fulltext,
+                s2_batch_download_fulltext_diff,
+                s2_batch_download_embeddings,
+                s2_batch_download_embeddings_diff,
+            )
         ),
         # Every 6 hours, for a log alert; it needs no S2 key, so it takes no limit.
         RunnerDeployment.from_flow(

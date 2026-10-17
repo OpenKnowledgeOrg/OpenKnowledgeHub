@@ -5,6 +5,7 @@
 Needs `uv` and `gcloud auth application-default login` with an account that can create and read objects in the bucket.
 Keep the API key in `~/.config/openknowledge/.env` as `S2_API_KEY=...` and let uv load it.
 Run only `publication-venues` locally. Every other dataset downloads through Batch.
+Direct local downloads do not participate in the shared managed-download budget.
 
 ```sh
 uv sync
@@ -59,8 +60,16 @@ Each submission keeps the same operation ID and job name across task retries, so
 `OKP_BATCH_WAIT_TIMEOUT_SECONDS` bounds each job's whole wait, including queued time and API outages, to 24 hours by default, separately from each task's `OKP_BATCH_MAX_RUN_SECONDS`.
 If that wait expires, the run fails and names the job.
 
-Both download deployments take the Prefect global concurrency limit `semantic-scholar`, which `okp serve` creates with a limit of 1, so their runs never overlap.
-Before submitting a job, a run deletes any download job still queued in Batch, such as one left by a run that failed or was cancelled, and waits for any still running.
+All six managed download deployments share the `semantic-scholar` concurrency limit of 1.
+One dataset job runs at a time, with up to `OKP_BATCH_PARALLELISM` parallel shards (8 when configured).
+Busy requests fail promptly. Recovery handles queued/running jobs of the same dataset family;
+active jobs from another family or an older unlabelled controller block new work.
+
+## Full-text and SPECTER2 archives
+
+Dedicated managed base/diff flows archive `s2orc_v2` and `embeddings-specter_v2` in the existing
+raw GCS bucket. They reuse pinned inventories, receipts, manifests and resumable shard downloads.
+Each dataset uses its own explicit release; these archives do not load into ClickHouse.
 
 ## Loading into ClickHouse
 

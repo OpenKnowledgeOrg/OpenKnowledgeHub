@@ -16,6 +16,7 @@ from openknowledge_core.ingestion import (
     ShardJobs,
     WatchdogService,
 )
+from openknowledge_core.ingestion.families import ArchiveFamily
 from openknowledge_pipelines.settings import (
     BatchSettings,
     CommonSettings,
@@ -159,13 +160,17 @@ async def open_batch_download(
 
 
 def batch_download_flows(
-    service: DownloadDatasetService, jobs: ShardJobs, settings: BatchSettings
+    service: DownloadDatasetService,
+    jobs: ShardJobs,
+    settings: BatchSettings,
+    family: ArchiveFamily = ArchiveFamily.CORE,
 ) -> S2BatchDownloadFlows:
     from openknowledge_pipelines.flows.s2_batch_download import s2_batch_download_flows
 
     return s2_batch_download_flows(
         service,
         jobs,
+        family=family,
         rounds=settings.task_retries + 1,
         task_retries=settings.task_retries,
         retry_delay_seconds=settings.task_retry_delay_seconds,

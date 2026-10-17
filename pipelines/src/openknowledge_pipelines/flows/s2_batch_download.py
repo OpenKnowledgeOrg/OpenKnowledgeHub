@@ -23,6 +23,7 @@ from openknowledge_core.ingestion import (
     ShardJobs,
 )
 from openknowledge_core.ingestion.errors import ManifestIncomplete
+from openknowledge_core.ingestion.families import ArchiveFamily, require_family
 from openknowledge_pipelines.flows.s2_download import retry_transient
 
 type S2BatchDownloadFlow = Flow[[DownloadDataset], CoroutineType[Any, Any, BatchDownloadResult]]
@@ -37,10 +38,16 @@ class S2BatchDownloadFlows:
     diff: S2BatchDiffDownloadFlow
 
 
+def _flow_name(family: ArchiveFamily, *, diff: bool = False) -> str:
+    suffix = "" if family == ArchiveFamily.CORE else f"-{family}"
+    return f"s2-batch-download{suffix}{'-diff' if diff else ''}"
+
+
 def s2_batch_download_flows(
     service: DownloadDatasetService,
     jobs: ShardJobs,
     *,
+    family: ArchiveFamily = ArchiveFamily.CORE,
     rounds: int,
     task_retries: int,
     retry_delay_seconds: float,
@@ -89,7 +96,7 @@ def s2_batch_download_flows(
     async def clear_earlier_jobs() -> None:
         """Not part of run-job, whose retry could find its own queued job and delete it."""
         logger = get_run_logger()
-        for earlier, queued in (await jobs.running()).items():
+        for earlier, queued in (await jobs.running(family)).items():
             if queued:
                 logger.info("Deleting %s, a download job that has not started", earlier)
                 await jobs.delete(earlier)
@@ -127,9 +134,7 @@ def s2_batch_download_flows(
         try:
             return await service.write_manifest(pinned)
         except ManifestIncomplete as exc:
-            deployment = (
-                "s2-batch-download-diff" if pinned.part is not None else "s2-batch-download"
-            )
+            deployment = _flow_name(family, diff=pinned.part is not None)
             raise ManifestIncomplete(
                 f"{exc}. Start a new {deployment}/control-vm run with the same parameters "
                 "to archive the remaining shards"
@@ -154,8 +159,10 @@ def s2_batch_download_flows(
             names.append(await run_job(job, round_))
         return names, await write_manifest(pinned)
 
-    @flow(name="s2-batch-download", persist_result=False)
+    @flow(name=_flow_name(family), persist_result=False)
     async def s2_batch_download(command: DownloadDataset) -> BatchDownloadResult:
+        require_family(command.dataset, family)
+        await clear_earlier_jobs()
         pinned = await pin_dataset(command)
         names, manifest = await archive(pinned)
         return BatchDownloadResult(
@@ -166,8 +173,10 @@ def s2_batch_download_flows(
             manifest=manifest,
         )
 
-    @flow(name="s2-batch-download-diff", persist_result=False)
+    @flow(name=_flow_name(family, diff=True), persist_result=False)
     async def s2_batch_download_diff(command: DownloadDiff) -> BatchDiffDownloadResult:
+        require_family(command.dataset, family)
+        await clear_earlier_jobs()
         pinned = await pin_diff(command)
         names: list[str] = []
         manifests: list[ObjectPath] = []

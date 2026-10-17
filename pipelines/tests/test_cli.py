@@ -19,7 +19,9 @@ from prefect.deployments.runner import RunnerDeployment
 from prefect.flows import load_flow_from_entrypoint
 
 from openknowledge_core.ingestion import (
+    DownloadDataset,
     DownloadDatasetService,
+    DownloadDiff,
     LoadDatasetService,
     WatchdogResult,
     WatchdogService,
@@ -74,7 +76,10 @@ def test_pin_prints_the_explicit_release() -> None:
 
 
 @pytest.mark.usefixtures("wired", "prefect_server")
-def test_download_runs_the_flow_and_prints_the_result() -> None:
+def test_download_runs_the_flow_and_prints_the_result(monkeypatch: pytest.MonkeyPatch) -> None:
+    for key in BATCH_ENV:
+        if key != "S2_API_KEY":
+            monkeypatch.delenv(key, raising=False)
     code, output = okp("download", "--release", "2026-10-06", "--dataset", "papers", *TARGET)
     assert code == 0, output
     result = json.loads(output.splitlines()[-1])
@@ -173,6 +178,7 @@ def test_serve_offers_the_load_flow_by_module_path(monkeypatch: pytest.MonkeyPat
     served: list[RunnerDeployment] = []
 
     def fake_serve(*found: RunnerDeployment, limit: int) -> None:
+        assert limit == 3
         served.extend(found)
 
     monkeypatch.setattr(deployments, "prefect_serve", fake_serve)
@@ -185,11 +191,15 @@ def test_serve_offers_the_load_flow_by_module_path(monkeypatch: pytest.MonkeyPat
         deployments.s2_load_diff,
         deployments.s2_batch_download,
         deployments.s2_batch_download_diff,
+        deployments.s2_batch_download_fulltext,
+        deployments.s2_batch_download_fulltext_diff,
+        deployments.s2_batch_download_embeddings,
+        deployments.s2_batch_download_embeddings_diff,
         deployments.watchdog,
     ]
-    assert [found.concurrency_limit for found in served] == [1, 1, 1, 1, None]
+    assert [found.concurrency_limit for found in served] == [1] * 8 + [None]
     *unscheduled, watchdog = served
-    assert [found.schedules for found in unscheduled] == [[], [], [], []]
+    assert [found.schedules for found in unscheduled] == [[]] * 8
     [scheduled] = cast("list[DeploymentScheduleCreate]", watchdog.schedules)
     assert isinstance(scheduled.schedule, CronSchedule)
     # from_flow stores no timezone for a cron, and the server reads None as UTC.
@@ -331,3 +341,42 @@ def test_download_shard_never_loads_prefect() -> None:
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout.split() == ["0", "False"]
+
+
+@pytest.mark.parametrize(
+    "name,dataset,family",
+    [
+        ("archive-fulltext", "s2orc_v2", "fulltext"),
+        ("archive-specter2", "embeddings-specter_v2", "embeddings"),
+    ],
+)
+@pytest.mark.parametrize("diff", [False, True])
+def test_archive_cli_routes_explicit_commands(
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    dataset: str,
+    family: str,
+    diff: bool,
+) -> None:
+    seen: list[DownloadDataset | DownloadDiff] = []
+
+    async def archive(command: DownloadDataset | DownloadDiff) -> DownloadDataset | DownloadDiff:
+        seen.append(command)
+        return command
+
+    route = f"s2_batch_download_{family}{'_diff' if diff else ''}"
+    monkeypatch.setattr(deployments, route, archive)
+    for key, value in BATCH_ENV.items():
+        monkeypatch.setenv(key, value)
+    args = [name, "--release", "2026-10-13", *TARGET]
+    if diff:
+        args += ["--from-release", "2026-10-06"]
+    code, output = okp(*args)
+    assert code == 0, output
+    [command] = seen
+    assert command.dataset == dataset
+    assert command.release == "2026-10-13"
+    assert (command.bucket, command.prefix) == ("raw", "s2")
+    assert isinstance(command, DownloadDiff) == diff
+    if isinstance(command, DownloadDiff):
+        assert command.from_release == "2026-10-06"

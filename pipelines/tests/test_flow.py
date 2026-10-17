@@ -17,11 +17,15 @@ from openknowledge_core.ingestion import (
     ShardJob,
 )
 from openknowledge_core.ingestion.errors import (
+    BatchRejected,
     BatchUnavailable,
     ContractViolation,
     GzipInvalid,
+    ManifestIncomplete,
+    SourceRejected,
     TableUnavailable,
 )
+from openknowledge_core.ingestion.families import ArchiveFamily, archive_family
 from openknowledge_pipelines.flows.s2_batch_download import s2_batch_download_flows
 from openknowledge_pipelines.flows.s2_download import S2DownloadFlow, s2_download_flow
 from openknowledge_pipelines.flows.s2_load import S2LoadFlow, s2_load_flows
@@ -146,7 +150,8 @@ class FakeJobs:
         self.deleted: list[str] = []
         self.waited: list[str] = []
 
-    async def running(self) -> dict[str, bool]:
+    async def running(self, family: ArchiveFamily = ArchiveFamily.CORE) -> dict[str, bool]:
+        self.family = family
         left, self.left = self.left, {}
         return left
 
@@ -245,3 +250,85 @@ async def test_a_lost_submission_reply_retries_the_same_operation(
     first, retry = jobs.attempts
     assert first == retry
     assert (jobs.submitted, result.jobs) == ([(0, 1)], ("job-1",))
+
+
+@pytest.mark.parametrize("dataset", ["s2orc_v2", "embeddings-specter_v2"])
+async def test_archive_families_resume_base_and_both_diff_parts(
+    dataset: str, service: DownloadDatasetService, source: FakeSource, store: FakeStore
+) -> None:
+    # Synthetic gzip fixtures exercise the archive protocol, not either dataset's real schema.
+    for name, data in PAPERS.items():
+        source.add(dataset, name, data)
+    source.add_diff(dataset, RELEASE, NEXT, dict(PAPERS), dict(PAPERS))
+    family = archive_family(dataset)
+    jobs = FakeJobs(service, failing={1})
+    flows = s2_batch_download_flows(
+        service, jobs, family=family, rounds=1, task_retries=0, retry_delay_seconds=0
+    )
+    base = COMMAND.model_copy(update={"dataset": dataset})
+    with pytest.raises(ManifestIncomplete):
+        await flows.dataset(base)
+    result = await flows.dataset(base)
+    assert jobs.submitted == [(0, 1), (1,)]
+    assert jobs.family == family
+    assert result.manifest.name == f"s2/{RELEASE}/{dataset}/manifest.json"
+    assert len(DatasetManifest.from_json(store.data(result.manifest)).entries) == 2
+
+    jobs.failing = {1}
+    diff = DIFF.model_copy(update={"dataset": dataset})
+    with pytest.raises(ManifestIncomplete):
+        await flows.diff(diff)
+    resumed = await flows.diff(diff)
+    assert (resumed.updates, resumed.deletes) == (2, 2)
+    assert [job.part for job in jobs.jobs[-2:]] == ["updates", "deletes"]
+    assert [job.shards for job in jobs.jobs[-2:]] == [(1,), (0, 1)]
+    assert len(resumed.manifests) == 2
+    assert (await flows.diff(diff)).jobs == ()
+
+
+@pytest.mark.parametrize("dataset", ["s2orc_v2", "embeddings-specter_v2"])
+async def test_missing_diff_does_not_create_manifest_or_submit_jobs(
+    dataset: str, service: DownloadDatasetService, store: FakeStore
+) -> None:
+    jobs = FakeJobs(service, failing=set())
+    flows = s2_batch_download_flows(
+        service,
+        jobs,
+        family=archive_family(dataset),
+        rounds=1,
+        task_retries=0,
+        retry_delay_seconds=0,
+    )
+    before = dict(store.objects)
+    with pytest.raises(SourceRejected, match="did not list exactly one diff"):
+        await flows.diff(DIFF.model_copy(update={"dataset": dataset}))
+    assert jobs.submitted == []
+    assert all(path.endswith("/release.json") for path in set(store.objects) - set(before))
+
+
+@pytest.mark.parametrize("diff", [False, True])
+async def test_refused_inventory_never_cleans_up_or_pins(
+    diff: bool, service: DownloadDatasetService, store: FakeStore
+) -> None:
+    class RefusedJobs(FakeJobs):
+        async def running(self, family: ArchiveFamily = ArchiveFamily.CORE) -> dict[str, bool]:
+            # The adapter has found an own-family queued job on one page, followed by a
+            # foreign/legacy job on another. It refuses the whole inventory before returning.
+            raise BatchRejected("foreign job must be drained")
+
+    jobs = RefusedJobs(service, failing=set())
+    flows = s2_batch_download_flows(
+        service,
+        jobs,
+        family=ArchiveFamily.FULLTEXT,
+        rounds=1,
+        task_retries=0,
+        retry_delay_seconds=0,
+    )
+    with pytest.raises(BatchRejected, match="must be drained"):
+        if diff:
+            await flows.diff(DIFF.model_copy(update={"dataset": "s2orc_v2"}))
+        else:
+            await flows.dataset(COMMAND.model_copy(update={"dataset": "s2orc_v2"}))
+    assert (jobs.deleted, jobs.waited, jobs.submitted) == ([], [], [])
+    assert not store.objects

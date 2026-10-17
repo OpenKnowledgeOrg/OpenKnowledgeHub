@@ -7,6 +7,7 @@ from typing import Literal, Protocol
 
 from openknowledge_contracts.datasets import DatasetName, ReleaseId, ReleaseMetadata
 from openknowledge_contracts.manifests import ObjectPath, ObjectRef
+from openknowledge_core.ingestion.families import ArchiveFamily
 from openknowledge_core.ingestion.models import (
     AppliedRelease,
     ByteStream,
@@ -103,8 +104,8 @@ class ShardJobs(Protocol):
         """Start one task per shard and return the job's name."""
         ...
 
-    async def running(self) -> dict[str, bool]:
-        """Map each unended download job, such as one a failed run left, to whether it is queued."""
+    async def running(self, family: ArchiveFamily = ArchiveFamily.CORE) -> dict[str, bool]:
+        """Return this family's active jobs; refuse foreign or unlabelled active downloads."""
         ...
 
     async def delete(self, name: str) -> None:
