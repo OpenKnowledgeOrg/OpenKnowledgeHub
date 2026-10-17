@@ -71,6 +71,15 @@ Dedicated managed base/diff flows archive `s2orc_v2` and `embeddings-specter_v2`
 raw GCS bucket. They reuse pinned inventories, receipts, manifests and resumable shard downloads.
 Each dataset uses its own explicit release; these archives do not load into ClickHouse.
 
+## Coordinated sync
+
+The Prefect deployment `s2-sync/control-vm` updates the seven core datasets in ClickHouse, then
+archives full text and SPECTER2 in GCS. It selects a release per dataset, catches up through
+contiguous diffs, and resumes from verified progress. Core failures block both large archives.
+Existing bases are required; core diffs above 30% of their verified baseline size are not loaded.
+The daily 01:30 Europe/Zurich schedule and both large-archive stages default disabled.
+Only one cycle runs at a time, so a long archive can delay the next cycle.
+
 ## Loading into ClickHouse
 
 ```sh

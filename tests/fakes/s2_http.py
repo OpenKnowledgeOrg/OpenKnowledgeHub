@@ -102,6 +102,8 @@ class FakeS2:
                 return failure
             return httpx.Response(failure)
         parts = path.strip("/").split("/")
+        if parts == ["release"]:
+            return httpx.Response(200, json=self.releases)
         if len(parts) == 2 and parts[0] == "release":
             release = self.releases[-1] if parts[1] == "latest" else parts[1]
             if release not in self.releases:

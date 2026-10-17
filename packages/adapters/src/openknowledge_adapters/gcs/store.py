@@ -55,6 +55,33 @@ class GcsArtifactStore:
         # aiohttp starts the read timer once the body is sent, so a slow upload is not cut.
         return cast(int, aiohttp.ClientTimeout(total=total, sock_read=self._request_timeout))
 
+    async def list_objects(self, prefix: ObjectPath) -> tuple[StoredObject, ...]:
+        params = {"prefix": prefix.name + "/"}
+        objects: list[StoredObject] = []
+        seen: set[str] = set()
+        try:
+            while True:
+                page = await self._storage.list_objects(
+                    prefix.bucket, params=params.copy(), timeout=self._timeout(0)
+                )
+                for item in page.get("items", []):
+                    path = ObjectPath(bucket=prefix.bucket, name=item["name"])
+                    if not path.name.startswith(prefix.name + "/"):
+                        raise ValueError("listing escaped prefix")
+                    objects.append(_stored(path, item))
+                token = page.get("nextPageToken")
+                if not token:
+                    return tuple(objects)
+                if not isinstance(token, str) or token in seen:
+                    raise ValueError("invalid pagination token")
+                seen.add(token)
+                params["pageToken"] = token
+        except aiohttp.ClientResponseError as exc:
+            error = _failure("list", prefix, exc)
+        except Exception as exc:
+            error = _unreachable("list", prefix, exc)
+        raise error
+
     async def stat(self, path: ObjectPath) -> StoredObject | None:
         try:
             metadata = await self._storage.download_metadata(

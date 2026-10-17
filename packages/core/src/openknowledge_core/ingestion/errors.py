@@ -118,3 +118,7 @@ class RowCountMismatch(IntegrityError):
 
 class ConflictingKeys(IntegrityError):
     """A key repeats in a release with other values, so load order picks its row."""
+
+
+class SharedCapacityError(BatchRejected):
+    """An active foreign job prevents any further source work."""

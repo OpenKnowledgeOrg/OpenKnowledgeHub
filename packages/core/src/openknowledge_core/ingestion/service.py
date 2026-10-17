@@ -96,6 +96,10 @@ class DownloadDatasetService:
         self._clock = clock
         self._links: dict[tuple[str | None, str, str], dict[str, ShardLink]] = {}
 
+    @property
+    def catalog(self) -> ReleaseCatalog:
+        return self._catalog
+
     async def pin_release(self, command: PinRelease) -> PinnedRelease:
         """``latest`` is resolved here and nowhere else; a stored record of a release wins."""
         if command.release != "latest":

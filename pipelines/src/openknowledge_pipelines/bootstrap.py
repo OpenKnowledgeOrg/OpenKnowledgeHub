@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator
-from contextlib import asynccontextmanager
+from collections.abc import AsyncGenerator, Callable
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from importlib.metadata import version
 from typing import TYPE_CHECKING
@@ -16,12 +16,15 @@ from openknowledge_core.ingestion import (
     ShardJobs,
     WatchdogService,
 )
+from openknowledge_core.ingestion.archive_progress import ArchiveProgress
+from openknowledge_core.ingestion.coordinator import CORE_ORDER, LARGE_ORDER
 from openknowledge_core.ingestion.families import ArchiveFamily
 from openknowledge_pipelines.settings import (
     BatchSettings,
     CommonSettings,
     LoadSettings,
     PipelineSettings,
+    SyncSettings,
     WatchdogSettings,
 )
 
@@ -29,6 +32,7 @@ if TYPE_CHECKING:
     from openknowledge_pipelines.flows.s2_batch_download import S2BatchDownloadFlows
     from openknowledge_pipelines.flows.s2_download import S2DownloadFlow
     from openknowledge_pipelines.flows.s2_load import S2LoadFlows
+    from openknowledge_pipelines.flows.s2_sync import SyncServices
     from openknowledge_pipelines.flows.watchdog import WatchdogFlow
 
 
@@ -175,3 +179,49 @@ def batch_download_flows(
         task_retries=settings.task_retries,
         retry_delay_seconds=settings.task_retry_delay_seconds,
     )
+
+
+@asynccontextmanager
+async def open_archive_progress(
+    settings: PipelineSettings,
+) -> AsyncGenerator[ArchiveProgress, None]:
+    async with open_service(settings) as service, gcs.connect(_gcs(settings)) as store:
+        yield ArchiveProgress(store, service, producer(settings), lambda: datetime.now(UTC))
+
+
+@asynccontextmanager
+async def open_sync(
+    settings: SyncSettings,
+    s2_lease: Callable[[], AbstractAsyncContextManager[None]],
+    load_lease: Callable[[], AbstractAsyncContextManager[None]],
+) -> AsyncGenerator[SyncServices, None]:
+    from openknowledge_core.ingestion.families import archive_family
+    from openknowledge_pipelines.flows.s2_sync import SyncServices
+
+    async with (
+        open_batch_download(settings) as (service, jobs),
+        gcs.connect(_gcs(settings)) as store,
+        clickhouse.connect(_clickhouse(settings, settings.clickhouse_timeout_seconds)) as ch,
+    ):
+        progress = ArchiveProgress(store, service, producer(settings), lambda: datetime.now(UTC))
+        loader = LoadDatasetService(
+            store=store,
+            tables=ch.tables,
+            applied=ch.applied,
+            producer=producer(settings),
+            clock=lambda: datetime.now(UTC),
+        )
+        yield SyncServices(
+            jobs=jobs,
+            catalog=service.catalog,
+            tables=ch.tables,
+            applied=ch.applied,
+            progress=progress,
+            downloads={
+                dataset: batch_download_flows(service, jobs, settings, archive_family(dataset))
+                for dataset in (*CORE_ORDER, *LARGE_ORDER)
+            },
+            loads=load_flows(loader, settings),
+            s2_lease=s2_lease,
+            load_lease=load_lease,
+        )
