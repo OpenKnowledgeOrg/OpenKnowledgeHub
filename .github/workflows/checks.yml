@@ -42,6 +42,12 @@ jobs:
           docker cp clickhouse:/usr/bin/clickhouse "$RUNNER_TEMP/clickhouse/clickhouse"
           docker rm clickhouse
           echo "$RUNNER_TEMP/clickhouse" >> "$GITHUB_PATH"
+      - name: Cache integration test images
+        env:
+          CLICKHOUSE_PORT: "18123"
+          GCS_PORT: "14443"
+          PREFECT_PORT: "14200"
+        run: docker compose -f tests/e2e/compose.yaml pull --policy always
       - run: uv run pytest -q
 
   # uv does not enforce import isolation, so each package also runs alone, with only its own

@@ -1,9 +1,10 @@
-"""``okp s2 load`` against ClickHouse and a fake GCS in Docker, which CI must have."""
+"""``okp s2 load`` against disposable ClickHouse, GCS and PostgreSQL-backed Prefect."""
 
 from __future__ import annotations
 
 import asyncio
 import gzip
+import inspect
 import json
 import os
 import shutil
@@ -12,11 +13,20 @@ import subprocess
 from collections.abc import Awaitable, Callable, Iterator
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import httpx
 import pytest
 from click.testing import CliRunner
-from prefect.testing.utilities import prefect_test_harness
+from prefect.events.worker import EventsWorker
+from prefect.logging.handlers import APILogHandler
+from prefect.settings import (
+    PREFECT_API_AUTH_STRING,
+    PREFECT_API_KEY,
+    PREFECT_API_URL,
+    temporary_settings,
+)
+from prefect.utilities.asyncutils import run_coro_as_sync
 
 from openknowledge_adapters import gcs
 from openknowledge_core.ingestion import (
@@ -25,7 +35,7 @@ from openknowledge_core.ingestion import (
     DownloadDiff,
     PinnedDataset,
 )
-from openknowledge_pipelines import cli
+from openknowledge_pipelines import admission, cli
 from tests.clickhouse_local import MIGRATIONS, section, up
 from tests.fakes.ports import PRODUCER, FakeSource, clock
 
@@ -51,18 +61,35 @@ def _free_port() -> str:
 
 @pytest.fixture(scope="module")
 def ports() -> Iterator[dict[str, str]]:
-    ports = {"CLICKHOUSE_PORT": _free_port(), "GCS_PORT": _free_port()}
+    ports = {name: _free_port() for name in ("CLICKHOUSE_PORT", "GCS_PORT", "PREFECT_PORT")}
     env = {**os.environ, **ports}
+    project = f"okp-e2e-{uuid4().hex}"
+    print(f"E2E Compose project: {project}", flush=True)
     compose = [
         DOCKER or "docker",
         "compose",
         "-p",
-        f"okp-e2e-{os.getpid()}",
+        project,
         "-f",
         str(E2E / "compose.yaml"),
     ]
     try:
-        subprocess.run([*compose, "up", "-d", "--wait"], env=env, check=True)
+        subprocess.run(
+            [
+                *compose,
+                "up",
+                "-d",
+                "--wait",
+                "--wait-timeout",
+                "120",
+                "--pull",
+                "never",
+                "--no-build",
+            ],
+            env=env,
+            check=True,
+            timeout=150,
+        )
         subprocess.run(
             [
                 *compose,
@@ -76,15 +103,67 @@ def ports() -> Iterator[dict[str, str]]:
             text=True,
             env=env,
             check=True,
+            timeout=30,
         )
+        database_version = subprocess.run(
+            [
+                *compose,
+                "exec",
+                "-T",
+                "postgres",
+                "psql",
+                "-U",
+                "e2e",
+                "-d",
+                "prefect",
+                "-Atc",
+                "SHOW server_version",
+            ],
+            env=env,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        ).stdout.strip()
+        assert database_version.split()[0] == "18.6", "E2E requires PostgreSQL 18.6"
+        api_url = f"http://127.0.0.1:{ports['PREFECT_PORT']}/api"
+        version = httpx.get(f"{api_url}/admin/version", timeout=5)
+        version.raise_for_status()
+        assert version.json() == "3.8.8", "E2E requires the pinned Prefect server"
         gcs_root = f"http://127.0.0.1:{ports['GCS_PORT']}"
         httpx.post(
             f"{gcs_root}/storage/v1/b", params={"project": "e2e"}, json={"name": BUCKET}
         ).raise_for_status()
-        with prefect_test_harness():
-            yield ports
+        with temporary_settings(
+            {
+                PREFECT_API_URL: api_url,
+                PREFECT_API_KEY: None,
+                PREFECT_API_AUTH_STRING: None,
+            }
+        ):
+            # One initialization per project; failed loads retain occupancy across tests.
+            admission.ensure_closed()
+            admission.status("open")
+            try:
+                yield ports
+            finally:
+                # Flush while the owned API is still available, as Prefect's harness does.
+                run_coro_as_sync(_drain_prefect_workers())
     finally:
-        subprocess.run([*compose, "down", "--volumes"], env=env, check=True)
+        subprocess.run(
+            [*compose, "down", "--volumes", "--timeout", "10"],
+            env=env,
+            check=True,
+            timeout=45,
+        )
+
+
+async def _drain_prefect_workers() -> None:
+    async with asyncio.timeout(30):
+        await APILogHandler.aflush()
+        result = EventsWorker.drain_all()
+        if inspect.isawaitable(result):
+            await result
 
 
 def packed(lines: list[str]) -> bytes:

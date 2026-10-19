@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import os
@@ -333,12 +334,14 @@ async def open_service(settings):
 bootstrap.open_service = open_service
 args = ["s2", "download-shard", "--release", "2026-10-06", "--dataset", "papers", "--shard", "0",
         "--bucket", "raw"]
-result = CliRunner().invoke(cli.main, args, env={"S2_API_KEY": "k"})
+worker_env = {"S2_API_KEY": "k", "BATCH_TASK_INDEX": "0", "BATCH_TASK_COUNT": "1",
+              "OKP_SHARD": "0", "OKP_BATCH_OPERATION_ID": "a" * 32}
+result = CliRunner().invoke(cli.main, args, env=worker_env)
 print(result.exit_code, "prefect" in sys.modules)
 """
 
 
-def test_download_shard_never_loads_prefect() -> None:
+def test_admitted_batch_worker_never_loads_prefect() -> None:
     env = {"PATH": os.environ["PATH"], "PYTHONPATH": str(ROOT)}
     result = subprocess.run(
         [sys.executable, "-c", NO_PREFECT], cwd=ROOT, env=env, capture_output=True, text=True
@@ -541,3 +544,132 @@ def test_read_base_cli_without_source_key_or_control_api(
     assert row["source"]["release"] == command.release
     assert row["source"]["object_ref"]["generation"] > 0
     assert store.objects == before
+
+
+def test_direct_mutation_requires_shared_admission_before_opening_clients(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("S2_API_KEY", "test-key")
+    with temporary_settings({PREFECT_API_URL: None}):
+        code, output = okp("pin", *TARGET)
+    assert code == 1
+    assert "Admission requires the shared PREFECT_API_URL" in output
+
+
+@pytest.mark.parametrize("partial_worker", [False, True])
+def test_direct_shard_without_complete_worker_context_requires_admission(
+    monkeypatch: pytest.MonkeyPatch,
+    partial_worker: bool,
+) -> None:
+    monkeypatch.setenv("S2_API_KEY", "test-key")
+    for name in ("BATCH_TASK_INDEX", "BATCH_TASK_COUNT", "OKP_BATCH_OPERATION_ID", "OKP_SHARD"):
+        monkeypatch.delenv(name, raising=False)
+    if partial_worker:
+        monkeypatch.setenv("BATCH_TASK_INDEX", "0")
+    with temporary_settings({PREFECT_API_URL: None}):
+        code, output = okp(
+            "download-shard", "--release", RELEASE, "--dataset", "papers", "--shard", "0", *TARGET
+        )
+    assert code == 1
+    assert "Admission requires the shared PREFECT_API_URL" in output
+
+
+@pytest.mark.usefixtures("wired")
+def test_admitted_batch_shard_finishes_without_reacquiring_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from openknowledge_pipelines import admission
+
+    @asynccontextmanager
+    async def forbidden() -> AsyncGenerator[None]:
+        pytest.fail("already admitted Batch worker must not reacquire admission")
+        yield
+
+    monkeypatch.setattr(admission, "execution", forbidden)
+    for name, value in {
+        "OKP_BATCH_OPERATION_ID": "a" * 32,
+        "BATCH_TASK_INDEX": "0",
+        "BATCH_TASK_COUNT": "1",
+        "OKP_SHARD": "0",
+    }.items():
+        monkeypatch.setenv(name, value)
+    code, output = okp(
+        "download-shard", "--release", RELEASE, "--dataset", "papers", "--shard", "0", *TARGET
+    )
+    assert code == 0, output
+
+
+def test_verify_manifest_remains_read_only_without_admission(
+    monkeypatch: pytest.MonkeyPatch,
+    service: DownloadDatasetService,
+    source: FakeSource,
+    store: FakeStore,
+) -> None:
+    from openknowledge_core.ingestion.archive_progress import ArchiveProgress
+    from openknowledge_pipelines import admission
+
+    source.add("s2orc_v2", "part.gz", PAPERS["part-0.gz"])
+    command = DownloadDataset(dataset="s2orc_v2", release=RELEASE, bucket="raw", prefix="s2")
+
+    async def archive() -> None:
+        pinned = await service.pin_dataset(command)
+        await service.archive_shard(pinned, pinned.shards[0])
+        await service.write_manifest(pinned)
+
+    asyncio.run(archive())
+    before = dict(store.objects)
+
+    @asynccontextmanager
+    async def progress(settings: PipelineSettings) -> AsyncGenerator[ArchiveProgress]:
+        yield ArchiveProgress(store, service, PRODUCER, clock)
+
+    def forbidden() -> None:
+        pytest.fail("read-only verification must not acquire admission")
+
+    monkeypatch.setenv("S2_API_KEY", "test-key")
+    monkeypatch.setattr(bootstrap, "open_archive_progress", progress)
+    monkeypatch.setattr(admission, "execution", forbidden)
+    with temporary_settings({PREFECT_API_URL: None}):
+        code, output = okp(
+            "verify-base-manifest", "--dataset", "s2orc_v2", "--release", RELEASE, *TARGET
+        )
+    assert code == 0, output
+    assert json.loads(output)["ref"]["path"]["bucket"] == "raw"
+    assert store.objects == before
+
+
+@pytest.mark.parametrize("measured", [False, True])
+def test_load_refuses_before_opening_regular_or_telemetry_clients(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, measured: bool
+) -> None:
+    for key, value in LOAD_ENV.items():
+        monkeypatch.setenv(key, value)
+
+    def forbidden(*args: object, **kwargs: object) -> None:
+        pytest.fail("closed admission must not open load or telemetry clients")
+
+    monkeypatch.setattr(bootstrap, "open_load_service", forbidden)
+    monkeypatch.setattr(bootstrap, "open_measured_load", forbidden)
+    options = ["--measurement-report", str(tmp_path / "measurement.json")] if measured else []
+    with temporary_settings({PREFECT_API_URL: None}):
+        code, output = okp("load", "--release", RELEASE, "--dataset", "papers", *TARGET, *options)
+    assert code == 1
+    assert "Admission requires the shared PREFECT_API_URL" in output
+
+
+@pytest.mark.parametrize("action", ["status", "close", "open"])
+def test_admission_command_failure_does_not_claim_closure(
+    monkeypatch: pytest.MonkeyPatch, action: str
+) -> None:
+    from openknowledge_pipelines import admission
+
+    def lost_response(action: str) -> admission.AdmissionStatus:
+        raise OSError("response lost after commit; secret diagnostic")
+
+    monkeypatch.setattr(admission, "status", lost_response)
+    result = CliRunner().invoke(cli.main, ["admission", action])
+    assert result.exit_code == 1
+    assert "state may be uncertain" in result.output
+    assert "inspect status before retrying" in result.output
+    assert "closed" not in result.output
+    assert "secret diagnostic" not in result.output

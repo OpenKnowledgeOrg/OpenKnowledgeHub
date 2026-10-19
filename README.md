@@ -2,7 +2,7 @@
 
 ## Semantic Scholar download, locally
 
-Needs `uv` and `gcloud auth application-default login` with an account that can create and read objects in the bucket.
+Needs `uv`, the shared `PREFECT_API_URL`, and `gcloud auth application-default login` with an account that can create and read objects in the bucket.
 Keep the API key in `~/.config/openknowledge/.env` as `S2_API_KEY=...` and let uv load it.
 Run only `publication-venues` locally. Every other dataset downloads through Batch.
 Direct local downloads do not participate in the shared managed-download budget.
@@ -171,3 +171,29 @@ docker run --rm pipelines s2 download-shard --help
 Pull requests build and smoke-test it.
 Every push to `main` publishes it as `europe-west4-docker.pkg.dev/openknowledge-508216/openknowledge/pipelines:<commit>` and writes the digest to the job summary.
 Deployments pin that digest, never a tag, and pass it as `OKP_IMAGE_DIGEST`: receipts record it, and an image cannot know its own digest.
+
+## Deployment admission
+
+All mutating CLI commands and served flows acquire the shared Prefect
+`deployment-admission` limit for their full lifetime. `okp admission close` sets its
+capacity to zero atomically, refusing new execution while admitted work finishes.
+`okp admission status` emits sanitized JSON; `okp admission open` is reserved for
+the deployment owner after verification. Fresh `okp serve` creates the limit closed;
+restarts preserve it. Existing binaries do not honor this boundary: install this
+prerequisite only in an operator-controlled idle window after disabling all old
+clients. Do not infer support from creation of a limit alone.
+
+Slots do not expire: failed work, a crashed/interrupted process or an uncertain API response blocks deployment
+until an operator reconciles the process and external jobs. Never reset slots just
+to pass drain. Existing Google Batch shard workers (valid task index/count, admitted operation marker
+and matching shard environment) finish
+already admitted work without Prefect access; direct shard commands require admission.
+This worker environment is an execution convention, not an authorization boundary.
+External Batch jobs, Prefect run states and ClickHouse activity must independently
+be checked before mutation. Closing admission alone does not establish idleness.
+
+Admission logs include an owner identifier at acquisition and completion. Preserve these
+logs with Prefect run and Batch operation evidence for explicit recovery. A failed command
+may still have external work running; only successful completion releases its slot.
+Never delete/recreate, deactivate or change decay on the gate while clients can run.
+Read-only `read-base` and `verify-base-manifest` commands remain usable while closed.

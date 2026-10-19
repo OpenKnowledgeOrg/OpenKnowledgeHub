@@ -29,7 +29,7 @@ from openknowledge_core.ingestion import (
 from openknowledge_core.ingestion.coordinator import SyncResult
 from openknowledge_core.ingestion.errors import IngestionError
 from openknowledge_core.ingestion.families import ArchiveFamily, require_family
-from openknowledge_pipelines import bootstrap
+from openknowledge_pipelines import admission, bootstrap
 from openknowledge_pipelines.flows.s2_sync import run_sync
 from openknowledge_pipelines.settings import (
     BatchSettings,
@@ -68,7 +68,11 @@ def one_clickhouse_loader() -> AbstractAsyncContextManager[None]:
 @flow(name="s2-load", persist_result=False)
 async def s2_load(command: LoadDataset) -> LoadDatasetResult:
     settings = LoadSettings()  # pyright: ignore[reportCallIssue]  # fields come from the environment
-    async with one_clickhouse_loader(), bootstrap.open_load_service(settings) as service:
+    async with (
+        admission.execution(),
+        one_clickhouse_loader(),
+        bootstrap.open_load_service(settings) as service,
+    ):
         # fn runs the body in this flow run, so its tasks do not start a subflow.
         return await bootstrap.load_flows(service, settings).dataset.fn(command)
 
@@ -76,14 +80,22 @@ async def s2_load(command: LoadDataset) -> LoadDatasetResult:
 @flow(name="s2-load-diff", persist_result=False)
 async def s2_load_diff(command: LoadDiff) -> LoadDiffResult:
     settings = LoadSettings()  # pyright: ignore[reportCallIssue]
-    async with one_clickhouse_loader(), bootstrap.open_load_service(settings) as service:
+    async with (
+        admission.execution(),
+        one_clickhouse_loader(),
+        bootstrap.open_load_service(settings) as service,
+    ):
         return await bootstrap.load_flows(service, settings).diff.fn(command)
 
 
 async def _download(command: DownloadDataset, family: ArchiveFamily) -> BatchDownloadResult:
     require_family(command.dataset, family)
     settings = BatchSettings()  # pyright: ignore[reportCallIssue]
-    async with one_s2_user(), bootstrap.open_batch_download(settings) as (service, jobs):
+    async with (
+        admission.execution(),
+        one_s2_user(),
+        bootstrap.open_batch_download(settings) as (service, jobs),
+    ):
         result = await bootstrap.batch_download_flows(service, jobs, settings, family).dataset.fn(
             command
         )
@@ -96,7 +108,7 @@ async def _download(command: DownloadDataset, family: ArchiveFamily) -> BatchDow
 async def _download_diff(command: DownloadDiff, family: ArchiveFamily) -> BatchDiffDownloadResult:
     require_family(command.dataset, family)
     settings = BatchSettings()  # pyright: ignore[reportCallIssue]
-    async with one_s2_user():
+    async with admission.execution(), one_s2_user():
         predecessor = None
         if family != ArchiveFamily.CORE:
             baseline = settings.sync.archives.get(command.dataset) if settings.sync else None
@@ -159,7 +171,10 @@ async def s2_sync() -> SyncResult:
     settings = SyncSettings()  # pyright: ignore[reportCallIssue]
     if settings.sync is None:
         raise IngestionError("OKP_SYNC must configure the coordinator bucket and baselines")
-    async with bootstrap.open_sync(settings, one_s2_user, one_clickhouse_loader) as services:
+    async with (
+        admission.execution(),
+        bootstrap.open_sync(settings, one_s2_user, one_clickhouse_loader) as services,
+    ):
         return await run_sync(settings.sync, services)
 
 
@@ -171,6 +186,7 @@ def sync_deployment() -> RunnerDeployment:
         entrypoint_type=EntrypointType.MODULE_PATH,
         schedules=[
             DeploymentScheduleCreate(
+                slug="s2-sync",
                 schedule=CronSchedule(cron="30 1 * * *", timezone="Europe/Zurich"),
                 active=settings.sync_schedule_enabled,
             )
@@ -185,7 +201,7 @@ def sync_deployment() -> RunnerDeployment:
 @flow(name="watchdog", persist_result=False)
 async def watchdog() -> WatchdogResult:
     settings = WatchdogSettings()  # pyright: ignore[reportCallIssue]
-    async with bootstrap.open_watchdog(settings) as service:
+    async with admission.execution(), bootstrap.open_watchdog(settings) as service:
         return await bootstrap.watchdog_flow(service, settings).fn()
 
 
@@ -202,6 +218,7 @@ def ensure_limits() -> None:
 
 
 def serve() -> None:
+    admission.ensure_closed()
     ensure_limits()
     prefect_serve(
         sync_deployment(),
@@ -243,7 +260,12 @@ def serve() -> None:
             watchdog,
             DEPLOYMENT,
             entrypoint_type=EntrypointType.MODULE_PATH,
-            cron=WATCHDOG_CRON,
+            schedules=[
+                DeploymentScheduleCreate(
+                    slug="watchdog",
+                    schedule=CronSchedule(cron=WATCHDOG_CRON),
+                )
+            ],
         ),
         limit=RUNS_AT_ONCE,
     )

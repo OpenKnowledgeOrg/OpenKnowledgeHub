@@ -1,7 +1,9 @@
 # ClickHouse as infra deploy/clickhouse configures it, with the raw bucket on a fake GCS.
-# tests/test_load_e2e.py starts it with free ports in CLICKHOUSE_PORT and GCS_PORT.
+# tests/test_load_e2e.py owns the project, volumes and loopback ports.
+# Runtime never pulls/builds: pre-cache these four images before running E2E.
 services:
   clickhouse:
+    pull_policy: never
     image: clickhouse/clickhouse-server:26.8.22.13@sha256:110d3d1f8e1ed7e451a6b5d85a16761e948ad43bc2d9ddf10b155964a8b2b40c
     environment:
       OPENKNOWLEDGE_PASSWORD: openknowledge
@@ -22,6 +24,7 @@ services:
       - gcs
 
   gcs:
+    pull_policy: never
     image: fsouza/fake-gcs-server:1.56.1@sha256:797ce226d62f947c009dc40246b30cfb456b8473d8241407f9d6f2c04e4d69ef
     command:
       - -scheme=http
@@ -30,3 +33,44 @@ services:
       - -public-host=gcs
     ports:
       - "127.0.0.1:${GCS_PORT:?}:4443"
+
+  postgres:
+    image: postgres:18.6@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336
+    pull_policy: never
+    environment:
+      POSTGRES_USER: e2e
+      POSTGRES_PASSWORD: e2e-only
+      POSTGRES_DB: prefect
+    volumes:
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U e2e -d prefect"]
+      interval: 1s
+      timeout: 5s
+      retries: 60
+
+  prefect:
+    image: prefecthq/prefect:3.8.8-python3.12@sha256:57e02b3f63d663e02b06d4127362ea48d92d4b361fbd96c8ba8f01e5702755f4
+    pull_policy: never
+    command: prefect server start --host 0.0.0.0
+    environment:
+      PREFECT_SERVER_DATABASE_CONNECTION_URL: postgresql+asyncpg://e2e:e2e-only@postgres:5432/prefect
+      PREFECT_SERVER_ANALYTICS_ENABLED: "false"
+      PREFECT_HOME: /root/.prefect
+      PREFECT_SERVER_CONCURRENCY_LEASE_STORAGE: prefect.server.concurrency.lease_storage.filesystem
+    volumes:
+      - prefect-home:/root/.prefect
+    ports:
+      - "127.0.0.1:${PREFECT_PORT:?}:4200"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:4200/api/health', timeout=2).close()"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+
+volumes:
+  postgres-data:
+  prefect-home:
