@@ -482,11 +482,12 @@ def admission_cli() -> None:
     """Deployment admission; opening requires the deployment owner's verified recovery."""
 
 
-def _admission_action(action: Literal["status", "close", "open"]) -> None:
+def _admission_action(action: Literal["status", "close", "open"], slots: int = 0) -> None:
     from openknowledge_pipelines import admission
 
     try:
-        click.echo(admission.status(action).model_dump_json())
+        current = admission.release(slots) if slots else admission.status(action)
+        click.echo(current.model_dump_json())
     except admission.AdmissionError as exc:
         raise click.ClickException(str(exc)) from None
     except Exception:
@@ -509,6 +510,20 @@ def admission_close() -> None:
 @admission_cli.command("open")
 def admission_open() -> None:
     _admission_action("open")
+
+
+@admission_cli.command(
+    "release",
+    help="Free all held slots while closed, once their runs and external work are gone.",
+)
+@click.option(
+    "--slots",
+    type=click.IntRange(min=1),
+    required=True,
+    help="The slots status reports as held.",
+)
+def admission_release(slots: int) -> None:
+    _admission_action("status", slots)
 
 
 @main.command(help=SERVE_HELP, short_help=SERVE_HELP)

@@ -165,3 +165,32 @@ async def test_cancellation_retains_real_occupancy(closed_admission: None) -> No
         if not task.done():
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_refusal_holds_no_slot_and_failed_read_only_work_releases(
+    closed_admission: None, caplog: pytest.LogCaptureFixture
+) -> None:
+    with pytest.raises(admission.AdmissionError) as refused:
+        async with admission.execution():
+            pytest.fail("closed gate admitted execution")
+    assert "reconcile" not in str(refused.value)
+    assert not [record for record in caplog.records if record.levelname == "ERROR"]
+    admission.status("open")
+    with pytest.raises(RuntimeError, match="query failed"):
+        async with admission.execution(retain_on_error=False):
+            raise RuntimeError("query failed")
+    assert admission.status().active_slots == 0
+
+
+async def test_release_frees_held_slots_only_while_closed(closed_admission: None) -> None:
+    admission.status("open")
+    with pytest.raises(RuntimeError, match="external job may survive"):
+        async with admission.execution():
+            raise RuntimeError("external job may survive")
+    with pytest.raises(admission.AdmissionError, match="Close admission"):
+        admission.release(1)
+    admission.status("close")
+    with pytest.raises(admission.AdmissionError, match="holds 1 slots, not 2"):
+        admission.release(2)
+    assert admission.release(1).active_slots == 0
+    admission.status("open")

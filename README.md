@@ -184,8 +184,9 @@ prerequisite only in an operator-controlled idle window after disabling all old
 clients. Do not infer support from creation of a limit alone.
 
 Slots do not expire: failed work, a crashed/interrupted process or an uncertain API response blocks deployment
-until an operator reconciles the process and external jobs. Never reset slots just
-to pass drain. Existing Google Batch shard workers (valid task index/count, admitted operation marker
+until an operator reconciles the process and external jobs. Once every run and job of
+the held slots is gone, `okp admission release --slots N` frees them while admission is
+closed; `N` must match `status`. Never release slots just to pass drain. Existing Google Batch shard workers (valid task index/count, admitted operation marker
 and matching shard environment) finish
 already admitted work without Prefect access; direct shard commands require admission.
 This worker environment is an execution convention, not an authorization boundary.
@@ -194,6 +195,8 @@ be checked before mutation. Closing admission alone does not establish idleness.
 
 Admission logs include an owner identifier at acquisition and completion. Preserve these
 logs with Prefect run and Batch operation evidence for explicit recovery. A failed command
-may still have external work running; only successful completion releases its slot.
+may still have external work running; only successful completion releases its slot,
+except for the read-only watchdog. A refusal the API proves applied nothing (a closed or
+missing limit) holds no slot, and a database error Prefect rolled back is retried.
 Never delete/recreate, deactivate or change decay on the gate while clients can run.
 Read-only `read-base` and `verify-base-manifest` commands remain usable while closed.

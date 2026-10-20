@@ -201,7 +201,10 @@ def sync_deployment() -> RunnerDeployment:
 @flow(name="watchdog", persist_result=False)
 async def watchdog() -> WatchdogResult:
     settings = WatchdogSettings()  # pyright: ignore[reportCallIssue]
-    async with admission.execution(), bootstrap.open_watchdog(settings) as service:
+    async with (
+        admission.execution(retain_on_error=False),
+        bootstrap.open_watchdog(settings) as service,
+    ):
         return await bootstrap.watchdog_flow(service, settings).fn()
 
 

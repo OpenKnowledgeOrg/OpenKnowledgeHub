@@ -170,3 +170,50 @@ async def test_release_accepts_capacity_close_after_its_pre_read(
         async with admission.execution():
             assert slots == 1
     assert slots == 0
+
+
+async def test_release_retries_a_rolled_back_decrement(monkeypatch: pytest.MonkeyPatch) -> None:
+    identity = "00000000-0000-0000-0000-000000000001"
+    slots = decrements = 0
+
+    def send(request: httpx.Request) -> httpx.Response:
+        nonlocal slots, decrements
+        if request.url.path.endswith("/csrf-token"):
+            return httpx.Response(404)
+        if request.url.path.endswith("/increment"):
+            slots += 1
+        elif request.url.path.endswith("/decrement"):
+            decrements += 1
+            if decrements == 1:
+                # Prefect's answer to a locked database: rolled back, nothing applied.
+                return httpx.Response(503, json={"exception_message": "Service Unavailable"})
+            slots -= 1
+        else:
+            return httpx.Response(
+                200,
+                json={
+                    "id": identity,
+                    "name": admission.NAME,
+                    "limit": admission.OPEN_LIMIT,
+                    "active_slots": slots,
+                    "slot_decay_per_second": 0,
+                    "active": True,
+                },
+            )
+        return httpx.Response(
+            200, json=[{"id": identity, "name": admission.NAME, "limit": admission.OPEN_LIMIT}]
+        )
+
+    @asynccontextmanager
+    async def client(httpx_settings: dict[str, object]) -> AsyncGenerator[PrefectClient]:
+        async with PrefectClient(
+            "http://127.0.0.1:1/api",
+            httpx_settings={**httpx_settings, "transport": httpx.MockTransport(send)},
+        ) as instance:
+            yield instance
+
+    monkeypatch.setattr(admission, "get_client", client)
+    with temporary_settings({PREFECT_API_URL: "http://127.0.0.1:1/api"}):
+        async with admission.execution():
+            assert slots == 1
+    assert (decrements, slots) == (2, 0)
