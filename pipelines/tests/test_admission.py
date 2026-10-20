@@ -167,7 +167,7 @@ async def test_cancellation_retains_real_occupancy(closed_admission: None) -> No
             await asyncio.gather(task, return_exceptions=True)
 
 
-async def test_refusal_holds_no_slot_and_failed_read_only_work_releases(
+async def test_refusal_holds_no_slot(
     closed_admission: None, caplog: pytest.LogCaptureFixture
 ) -> None:
     with pytest.raises(admission.AdmissionError) as refused:
@@ -175,10 +175,6 @@ async def test_refusal_holds_no_slot_and_failed_read_only_work_releases(
             pytest.fail("closed gate admitted execution")
     assert "reconcile" not in str(refused.value)
     assert not [record for record in caplog.records if record.levelname == "ERROR"]
-    admission.status("open")
-    with pytest.raises(RuntimeError, match="query failed"):
-        async with admission.execution(retain_on_error=False):
-            raise RuntimeError("query failed")
     assert admission.status().active_slots == 0
 
 

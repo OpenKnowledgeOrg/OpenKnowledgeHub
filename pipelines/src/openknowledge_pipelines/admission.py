@@ -2,8 +2,9 @@
 
 import asyncio
 import logging
+import time
 from collections.abc import AsyncGenerator, Awaitable, Callable, Generator
-from contextlib import asynccontextmanager, contextmanager, suppress
+from contextlib import asynccontextmanager, contextmanager
 from typing import Literal
 from uuid import UUID, uuid4
 
@@ -103,12 +104,20 @@ async def _retrying[T](call: Callable[[], Awaitable[T]]) -> T:
     return await call()
 
 
+def _retried[T](call: Callable[[], T]) -> T:
+    for delay in (0.5, 1, 2):
+        try:
+            return call()
+        except _RolledBack:
+            time.sleep(delay)
+    return call()
+
+
 @asynccontextmanager
-async def execution(*, retain_on_error: bool = True) -> AsyncGenerator[None]:
+async def execution() -> AsyncGenerator[None]:
     """Hold one admission slot for the work inside.
 
     A failure retains the slot, since it may leave Batch, native or database work alive.
-    Work that leaves nothing behind passes ``retain_on_error=False``.
     """
     _require_server()
     owner = uuid4().hex
@@ -167,11 +176,7 @@ async def execution(*, retain_on_error: bool = True) -> AsyncGenerator[None]:
         try:
             yield
         except BaseException:
-            if retain_on_error:
-                _LOG.error("Execution failed or interrupted; admission retained owner=%s", owner)
-            else:
-                with suppress(AdmissionError):
-                    await _release(client, current.id, owner)
+            _LOG.error("Execution failed or interrupted; admission retained owner=%s", owner)
             raise
         await _release(client, current.id, owner)
 
@@ -223,7 +228,7 @@ def ensure_closed() -> None:
             ) as client,
         ):
             try:
-                current = client.read_global_concurrency_limit_by_name(NAME)
+                current = _retried(lambda: client.read_global_concurrency_limit_by_name(NAME))
             except ObjectNotFound:
                 client.create_global_concurrency_limit(
                     GlobalConcurrencyLimitCreate(name=NAME, limit=0)
@@ -253,15 +258,14 @@ def _control() -> Generator[SyncPrefectClient]:
 
 def status(action: Literal["status", "close", "open"] = "status") -> AdmissionStatus:
     with _control() as client:
-        current = client.read_global_concurrency_limit_by_name(NAME)
+        current = _retried(lambda: client.read_global_concurrency_limit_by_name(NAME))
         _validate(current)
         if action == "open" and current.active_slots != 0:
             raise AdmissionError("Admission still occupied; reconcile work before reopening")
         if action in ("close", "open"):
-            client.update_global_concurrency_limit(
-                NAME, GlobalConcurrencyLimitUpdate(limit=0 if action == "close" else OPEN_LIMIT)
-            )
-            current = client.read_global_concurrency_limit_by_name(NAME)
+            update = GlobalConcurrencyLimitUpdate(limit=0 if action == "close" else OPEN_LIMIT)
+            _retried(lambda: client.update_global_concurrency_limit(NAME, update))
+            current = _retried(lambda: client.read_global_concurrency_limit_by_name(NAME))
             _validate(current)
         return AdmissionStatus(closed=current.limit == 0, active_slots=current.active_slots)
 
@@ -273,13 +277,14 @@ def release(slots: int) -> AdmissionStatus:
     closed. ``slots`` must match the count held, so nothing changed since it was inspected.
     """
     with _control() as client:
-        current = client.read_global_concurrency_limit_by_name(NAME)
+        current = _retried(lambda: client.read_global_concurrency_limit_by_name(NAME))
         _validate(current)
         if current.limit != 0:
             raise AdmissionError("Close admission before releasing slots")
         if current.active_slots != slots:
             raise AdmissionError(f"Admission holds {current.active_slots} slots, not {slots}")
-        client.update_global_concurrency_limit(NAME, GlobalConcurrencyLimitUpdate(active_slots=0))
-        current = client.read_global_concurrency_limit_by_name(NAME)
+        update = GlobalConcurrencyLimitUpdate(active_slots=0)
+        _retried(lambda: client.update_global_concurrency_limit(NAME, update))
+        current = _retried(lambda: client.read_global_concurrency_limit_by_name(NAME))
         _validate(current)
         return AdmissionStatus(closed=current.limit == 0, active_slots=current.active_slots)

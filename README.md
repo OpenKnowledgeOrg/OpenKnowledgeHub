@@ -195,8 +195,11 @@ be checked before mutation. Closing admission alone does not establish idleness.
 
 Admission logs include an owner identifier at acquisition and completion. Preserve these
 logs with Prefect run and Batch operation evidence for explicit recovery. A failed command
-may still have external work running; only successful completion releases its slot,
-except for the read-only watchdog. A refusal the API proves applied nothing (a closed or
+may still have external work running; only successful completion releases its slot.
+The read-only watchdog takes no slot, so it keeps its heartbeat while closed. A refusal the API proves applied nothing (a closed or
 missing limit) holds no slot, and a database error Prefect rolled back is retried.
 Never delete/recreate, deactivate or change decay on the gate while clients can run.
 Read-only `read-base` and `verify-base-manifest` commands remain usable while closed.
+A scheduled sync or load that starts while admission is closed is refused, ends Failed and
+sends a `run_failed` mail. That is expected during a deployment window; a gate left closed
+for days mails at every scheduled run.

@@ -14,7 +14,7 @@ from typing import cast
 import pytest
 from click.testing import CliRunner
 from prefect.client.orchestration import get_client
-from prefect.client.schemas.actions import DeploymentScheduleCreate
+from prefect.client.schemas.actions import DeploymentScheduleCreate, GlobalConcurrencyLimitUpdate
 from prefect.client.schemas.objects import State
 from prefect.client.schemas.schedules import CronSchedule
 from prefect.context import use_profile
@@ -30,7 +30,7 @@ from openknowledge_core.ingestion import (
     WatchdogResult,
     WatchdogService,
 )
-from openknowledge_pipelines import bootstrap, cli, deployments
+from openknowledge_pipelines import admission, bootstrap, cli, deployments
 from openknowledge_pipelines.settings import LoadSettings, PipelineSettings, WatchdogSettings
 from tests.fakes.ports import (
     PAPERS,
@@ -234,8 +234,19 @@ async def test_the_watchdog_deployment_runs_over_the_wired_service(
     for name, value in LOAD_ENV.items():
         monkeypatch.setenv(name, value)
     caplog.set_level(logging.INFO)
-    # Flow is invariant in its return type, so pyright cannot pick the awaitable overload here.
-    state = await cast("Awaitable[State[WatchdogResult]]", deployments.watchdog(return_state=True))
+    # The watchdog only reads, so it keeps reporting while admission is closed.
+    admission.status("close")
+    try:
+        # Flow is invariant in its return type, so pyright cannot pick the awaitable overload.
+        state = await cast(
+            "Awaitable[State[WatchdogResult]]", deployments.watchdog(return_state=True)
+        )
+    finally:
+        # Other tests may leave a slot held, which open refuses; restore capacity directly.
+        with get_client(sync_client=True) as client:
+            client.update_global_concurrency_limit(
+                admission.NAME, GlobalConcurrencyLimitUpdate(limit=admission.OPEN_LIMIT)
+            )
     assert state.is_completed()
     result = await state.aresult()
     assert (result.stale, len(result.never_loaded)) == ((), 5)
