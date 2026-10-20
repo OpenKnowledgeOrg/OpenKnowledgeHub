@@ -277,3 +277,9 @@ def test_base_and_diff_labels_and_task_budget(
     spec = job_spec(CONFIG, job)
     assert spec["labels"]["archive-family"] == family
     assert spec["taskGroups"][0]["parallelism"] == 8
+
+
+def test_batch_worker_context_identifies_the_admitted_operation() -> None:
+    spec = job_spec(CONFIG, JOB)
+    variables = spec["taskGroups"][0]["taskSpec"]["environment"]["variables"]
+    assert variables == {**CONFIG.environment, "OKP_BATCH_OPERATION_ID": JOB.operation_id.hex}

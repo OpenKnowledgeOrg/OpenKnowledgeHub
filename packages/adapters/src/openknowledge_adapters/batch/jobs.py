@@ -170,7 +170,10 @@ def job_spec(config: BatchConfig, job: ShardJob) -> dict[str, Any]:
                 "taskSpec": {
                     "runnables": [{"container": {"imageUri": config.image, "commands": command}}],
                     "environment": {
-                        "variables": config.environment,
+                        "variables": {
+                            **config.environment,
+                            "OKP_BATCH_OPERATION_ID": job.operation_id.hex,
+                        },
                         "secretVariables": config.secrets,
                     },
                     "maxRunDuration": f"{config.max_run_seconds}s",
