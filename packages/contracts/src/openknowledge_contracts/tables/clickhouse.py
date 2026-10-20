@@ -52,11 +52,17 @@ class Column:
     """The expression of a ``DEFAULT`` column, which a load leaves to the table."""
 
 
-_VERSION = Column(VERSION, "UInt64", materialized="(toUInt64(source_release) * 2) + is_deleted")
-CITATION_VERSION = (
-    "((toUInt64(source_release) * 4) + (toUInt64(is_deleted) * 2)) + toUInt64(NOT contexts_is_null)"
-)
 _REMOVED = Column(REMOVED, "Bool", default="false")
+
+
+def version_expression(contract: DatasetContract) -> str:
+    """How the table ranks a key's rows: release, then deletion, then an enriched value."""
+    if contract.enriched is None:
+        return "(toUInt64(source_release) * 2) + is_deleted"
+    return (
+        "((toUInt64(source_release) * 4) + (toUInt64(is_deleted) * 2)) + "
+        f"toUInt64(NOT {contract.enriched}{NULL_FLAG_SUFFIX})"
+    )
 
 
 def table_columns(contract: DatasetContract) -> tuple[Column, ...]:
@@ -70,14 +76,12 @@ def table_columns(contract: DatasetContract) -> tuple[Column, ...]:
         columns.append(Column(field.name, renderer.render(field.type, field.nullable, field.name)))
         if field.nullable and _is_composite(field.type):
             columns.append(Column(field.name + NULL_FLAG_SUFFIX, "Bool"))
-    columns.append(
-        Column(VERSION, "UInt64", materialized=CITATION_VERSION)
-        if contract.name == "citations"
-        else _VERSION
-    )
+    columns.append(Column(VERSION, "UInt64", materialized=version_expression(contract)))
     if contract.updates == "snapshot":
         columns.append(_REMOVED)
     names = [column.name for column in columns]
+    if contract.enriched is not None and contract.enriched + NULL_FLAG_SUFFIX not in names:
+        raise ValueError(f"{contract.name}: enriched {contract.enriched!r} has no null flag")
     if duplicates := sorted({name for name in names if names.count(name) > 1}):
         raise ValueError(f"{contract.name}: columns {duplicates} appear twice")
     if unused := sorted(contract.null_as_empty - renderer.collapsed):

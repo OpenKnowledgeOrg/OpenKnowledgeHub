@@ -31,4 +31,5 @@ CITATIONS = DatasetContract(
         ]
     ),
     null_as_empty=frozenset({"intents.item"}),
+    enriched="contexts",
 )

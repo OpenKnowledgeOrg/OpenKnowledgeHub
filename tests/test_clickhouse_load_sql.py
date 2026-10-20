@@ -511,7 +511,7 @@ def test_a_repeated_key_is_identical_or_conflicting(
     )
     key = first[contract.key[0]]
     expected = {"identical_rows": 2, "conflicting_keys": 1, "examples": [f"({key!r})"]}
-    if contract.name == "citations":
+    if contract.enriched is not None:
         expected["enriched_rows"] = 0
     assert found == [expected]
 

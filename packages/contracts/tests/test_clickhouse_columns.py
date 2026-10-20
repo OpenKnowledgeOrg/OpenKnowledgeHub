@@ -83,3 +83,16 @@ def test_a_flag_may_not_collide_with_a_source_field() -> None:
 def test_types_without_a_lossless_mapping_are_refused() -> None:
     with pytest.raises(TypeError, match="stamp"):
         columns(required("stamp", pa.timestamp("ms")))
+
+
+@pytest.mark.parametrize(
+    ("field", "error"),
+    [
+        (required("text", list_of(pa.string())), "nullable field"),
+        (optional("text", pa.string()), "no null flag"),
+    ],
+)
+def test_an_enriched_field_must_be_a_nullable_composite(field: ArrowField, error: str) -> None:
+    source = pa.schema([required("id", pa.uint64()), field])
+    with pytest.raises(ValueError, match=error):
+        table_columns(DatasetContract("example", "example", ("id",), source, enriched="text"))

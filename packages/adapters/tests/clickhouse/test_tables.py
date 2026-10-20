@@ -4,7 +4,8 @@ import httpx
 import pytest
 
 from openknowledge_adapters import clickhouse
-from openknowledge_contracts.tables.clickhouse import CITATION_VERSION
+from openknowledge_contracts.tables.clickhouse import version_expression
+from openknowledge_contracts.tables.s2 import CITATIONS
 from openknowledge_core.ingestion import LoadDataset, LoadDatasetService
 from openknowledge_core.ingestion.errors import (
     ContractViolation,
@@ -69,7 +70,7 @@ async def test_citations_require_enrichment_versions_before_checkpoint_reuse(cur
         else:
             assert "system.columns" in query
             row = {
-                "default_expression": CITATION_VERSION
+                "default_expression": version_expression(CITATIONS)
                 if current
                 else "(toUInt64(source_release) * 2) + is_deleted"
             }

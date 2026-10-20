@@ -107,8 +107,8 @@ def duplicates_query(contract: DatasetContract, objects: int, source: Source = "
 
     Records repeat identically when every stored value is the same, whatever the key order or
     spacing of their lines. The values are hashed as one tuple, because a null argument would
-    make the hash null and ``min`` and ``max`` skip it. Citations hash their contexts apart from
-    the other values, for a narrowly defined context-enrichment rule.
+    make the hash null and ``min`` and ``max`` skip it. A contract's ``enriched`` field is hashed
+    apart from the other values, so that its records may differ there alone.
     """
     query = _Query(contract)
     fields = fields_of(contract.source)
@@ -117,8 +117,8 @@ def duplicates_query(contract: DatasetContract, objects: int, source: Source = "
     lines = "\n    UNION ALL\n    ".join(
         f"SELECT line FROM {_source(source, f'source_file_{index}')}" for index in range(objects)
     )
-    if contract.name == "citations":
-        return _citation_duplicates(fields, values, key, lines)
+    if contract.enriched is not None:
+        return _enriched_duplicates(fields, values, key, lines, contract.enriched)
     records = (
         f"{_with(fields)}SELECT tuple({key}) AS record_key, "
         f"cityHash64(tuple({', '.join(values.values())})) AS record_hash\n"
@@ -137,30 +137,29 @@ def duplicates_query(contract: DatasetContract, objects: int, source: Source = "
     )
 
 
-def _citation_duplicates(
-    fields: Sequence[ArrowField], values: dict[str, str], key: str, lines: str
+def _enriched_duplicates(
+    fields: Sequence[ArrowField], values: dict[str, str], key: str, lines: str, enriched: str
 ) -> str:
-    """Only missing contexts may yield to one agreed non-null value of the same citation.
+    """Only a missing ``enriched`` value may yield to one agreed non-null value of the same key.
 
     Hashes only ever compare records of one key, so 64 bits suffice and keep the per-key state
     of a full release small. Nullable values stay inside tuples so aggregates cannot silently
     skip them. As with the other datasets, a collision could theoretically hide a conflict.
     """
-    other = ", ".join(
-        value for name, value in values.items() if name not in ("contexts", "contexts_is_null")
-    )
+    flag = enriched + NULL_FLAG_SUFFIX
+    other = ", ".join(value for name, value in values.items() if name not in (enriched, flag))
     records = (
         f"{_with(fields)}SELECT tuple({key}) AS record_key,\n"
         f"    cityHash64(tuple({other})) AS other_hash,\n"
-        f"    cityHash64(tuple({values['contexts']})) AS contexts_hash,\n"
-        f"    {values['contexts_is_null']} AS contexts_null\n"
+        f"    cityHash64(tuple({values[enriched]})) AS enriched_hash,\n"
+        f"    {values[flag]} AS enriched_null\n"
         f"FROM (\n    {lines}\n)"
     )
     keys = (
-        "SELECT record_key, count() AS n, countIf(contexts_null) AS nulls,\n"
+        "SELECT record_key, count() AS n, countIf(enriched_null) AS nulls,\n"
         "    min(other_hash) != max(other_hash)\n"
-        "        OR minIf(contexts_hash, NOT contexts_null)\n"
-        "            != maxIf(contexts_hash, NOT contexts_null)\n"
+        "        OR minIf(enriched_hash, NOT enriched_null)\n"
+        "            != maxIf(enriched_hash, NOT enriched_null)\n"
         "        AS conflicting,\n"
         "    (nulls > 0 AND nulls < n) AS enriched\n"
         f"FROM (\n{records}\n) GROUP BY record_key HAVING n > 1"

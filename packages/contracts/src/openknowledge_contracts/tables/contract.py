@@ -14,7 +14,8 @@ The table computes ``version`` from ``source_release`` and ``is_deleted`` and ke
 the highest version per key: the latest release wins, and within a release a delete outranks an
 upsert, because a diff applies its updates before its deletes. A version depends only on its own
 row, so replayed batches converge in any order, as long as a key appears at most once per release
-and operation.
+and operation. A contract with an ``enriched`` field ranks a row holding it above one without it,
+after release and deletion.
 
 A snapshot contract's table also has a ``removed`` column, which a load never sets.
 """
@@ -58,6 +59,9 @@ class DatasetContract:
         updates: How the dataset follows its releases. ``diffs`` applies each release's
             diff. ``snapshot`` loads every release whole and flags the keys a release no
             longer lists in a ``removed`` column that loads never set.
+        enriched: A nullable field that some records of a key may lack within one release
+            while others hold it. A key may then repeat with that difference alone, as long
+            as every record holding it agrees, and the table keeps a record holding it.
     """
 
     name: DatasetName
@@ -66,6 +70,7 @@ class DatasetContract:
     source: pa.Schema
     null_as_empty: frozenset[str] = frozenset()
     updates: UpdateMode = "diffs"
+    enriched: str | None = None
 
     def __post_init__(self) -> None:
         """Refuse a missing or nullable key, and field names that repeat or are taken."""
@@ -80,6 +85,10 @@ class DatasetContract:
                 raise ValueError(f"{self.name}: key {name!r} must be a required source field")
         if clash := sorted(fields.keys() & {*PROVENANCE.names, VERSION, REMOVED}):
             raise ValueError(f"{self.name}: source fields {clash} shadow table columns")
+        if self.enriched is not None and not (
+            self.enriched in self.source.names and fields[self.enriched].nullable
+        ):
+            raise ValueError(f"{self.name}: enriched {self.enriched!r} must be a nullable field")
 
     @property
     def schema(self) -> pa.Schema:
