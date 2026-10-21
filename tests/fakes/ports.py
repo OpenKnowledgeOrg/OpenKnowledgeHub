@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import gzip
-from collections.abc import AsyncGenerator, Sequence
+from collections.abc import AsyncGenerator, Mapping, Sequence
 from contextlib import aclosing
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Literal
+from typing import Any, Literal
 from uuid import UUID
 
 from pydantic import SecretStr
@@ -42,6 +42,16 @@ from openknowledge_core.ingestion.models import (
     TableState,
 )
 from openknowledge_core.ingestion.service import DownloadDatasetService
+from openknowledge_core.search.errors import BulkRefused
+from openknowledge_core.search.models import (
+    AbstractRow,
+    BulkOperation,
+    CorpusSlice,
+    DeleteDocument,
+    PaperRow,
+    SourceRows,
+)
+from openknowledge_core.search.service import document_operation
 from tests.fakes.checksums import crc32c_b64, md5_b64
 
 RELEASE = "2026-10-06"
@@ -440,3 +450,94 @@ class FakeJobs:
     async def wait(self, name: str) -> JobOutcome:
         self.waited.append(name)
         return self.outcomes[name]
+
+
+class FakeSearchSource:
+    """The two tables as the search source reads them: joined rows for a base or a diff."""
+
+    def __init__(self) -> None:
+        self.base_rows: list[SourceRows] = []
+        self.diff_rows: list[SourceRows] = []
+        self.asked: list[tuple[str | None, str, CorpusSlice]] = []
+
+    async def base(self, release: str, corpus_slice: CorpusSlice) -> AsyncGenerator[SourceRows]:
+        self.asked.append((None, release, corpus_slice))
+        return self._stream(self.base_rows)
+
+    async def diff(
+        self, from_release: str, release: str, corpus_slice: CorpusSlice
+    ) -> AsyncGenerator[SourceRows]:
+        self.asked.append((from_release, release, corpus_slice))
+        return self._stream(self.diff_rows)
+
+    async def _stream(self, rows: list[SourceRows]) -> AsyncGenerator[SourceRows]:
+        for row in rows:
+            yield row
+
+
+class FakeSearchSink:
+    """An index per name, keeping each id's latest version and its source, or None once deleted."""
+
+    def __init__(self) -> None:
+        self.indices: dict[str, dict[str, tuple[int, dict[str, Any] | None]]] = {}
+        self.created: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
+        self.requests: list[tuple[str, int]] = []
+        self.refreshed: list[str] = []
+        self.refused: str | None = None
+        """A corpus ID whose item every bulk request refuses."""
+
+    async def exists(self, index: str) -> bool:
+        return index in self.indices
+
+    async def create_index(
+        self, index: str, mapping: Mapping[str, Any], settings: Mapping[str, Any]
+    ) -> None:
+        self.indices[index] = {}
+        self.created[index] = (dict(mapping), dict(settings))
+
+    async def bulk(self, index: str, operations: Sequence[BulkOperation]) -> None:
+        self.requests.append((index, len(operations)))
+        documents = self.indices.setdefault(index, {})
+        for operation in operations:
+            current = documents.get(operation.id)
+            if operation.id == self.refused or (current and operation.version < current[0]):
+                raise BulkRefused(
+                    f"{index}: 1 of {len(operations)} bulk items refused; "
+                    f"corpusid {operation.id}: version_conflict_engine_exception"
+                )
+            source = None if isinstance(operation, DeleteDocument) else operation.document.source()
+            documents[operation.id] = (operation.version, source)
+
+    async def refresh(self, index: str) -> None:
+        self.refreshed.append(index)
+
+    async def count(self, index: str) -> int:
+        return sum(1 for _, source in self.indices[index].values() if source is not None)
+
+
+def paper_row(corpusid: int, version: int, **values: Any) -> PaperRow:  # noqa: ANN401
+    """A live ``papers`` row at ``version`` with ``values`` over the defaults."""
+    return PaperRow.model_validate(
+        {
+            "corpusid": corpusid,
+            "version": version,
+            "source_release": RELEASE,
+            "is_deleted": False,
+            **values,
+        }
+    )
+
+
+def abstract_row(corpusid: int, version: int, text: str = "A synthetic abstract.") -> AbstractRow:
+    return AbstractRow(
+        corpusid=corpusid, version=version, source_release=RELEASE, is_deleted=False, abstract=text
+    )
+
+
+def search_document(paper: PaperRow, abstract: AbstractRow | None = None) -> BulkOperation:
+    """The write the core builds for ``paper`` and ``abstract`` at contract version 1."""
+    operation = document_operation(
+        SourceRows(corpusid=paper.corpusid, paper=paper, abstract=abstract), 1
+    )
+    assert operation is not None
+    return operation

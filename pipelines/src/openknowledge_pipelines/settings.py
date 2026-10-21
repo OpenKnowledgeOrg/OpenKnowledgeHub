@@ -10,6 +10,7 @@ from pydantic import (
     PositiveFloat,
     PositiveInt,
     SecretStr,
+    field_validator,
 )
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -59,6 +60,23 @@ class WatchdogSettings(LoadSettings):
     """Days since its last load after which a table gets a ``watchdog stale`` line."""
     watchdog_timeout_seconds: PositiveFloat = 60.0
     """Per query, in place of the load timeout, which allows for an insert of hours."""
+
+
+class SearchSettings(LoadSettings):
+    opensearch_url: HttpUrl
+    opensearch_user: str = "hub-indexer"
+    opensearch_password: SecretStr = Field(validation_alias="OPENSEARCH_PASSWORD")
+    opensearch_timeout_seconds: PositiveFloat = 60.0
+    """Per request, where a bulk request carries about 5 MB."""
+    index_shards: PositiveInt = 5
+    """Primary shards of an index that okp search index creates."""
+
+    @field_validator("opensearch_url")
+    @classmethod
+    def _without_credentials(cls, url: HttpUrl) -> HttpUrl:
+        if url.username is not None or url.password is not None:
+            raise ValueError("must not carry a user or password")
+        return url
 
 
 class BatchSettings(PipelineSettings):

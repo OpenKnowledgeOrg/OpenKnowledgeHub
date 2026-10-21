@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from collections.abc import Callable, Coroutine, Mapping
 from contextlib import aclosing
 from pathlib import Path
@@ -23,12 +24,14 @@ from openknowledge_core.ingestion import (
     PinRelease,
 )
 from openknowledge_core.ingestion.families import ArchiveFamily, archive_family
+from openknowledge_core.search import IndexPapers
 from openknowledge_pipelines import bootstrap
 from openknowledge_pipelines.settings import (
     BatchSettings,
     CommonSettings,
     LoadSettings,
     PipelineSettings,
+    SearchSettings,
     WatchdogSettings,
 )
 
@@ -38,6 +41,7 @@ DOWNLOAD_SHARD_HELP = "Archive one shard of a dataset, or one file of its diff, 
 LOAD_HELP = "Load an archived dataset into its ClickHouse table through the Prefect flow."
 LOAD_DIFF_HELP = "Load an archived diff into its ClickHouse table through the Prefect flow."
 SERVE_HELP = "Serve the flows the control VM runs, until stopped."
+INDEX_HELP = "Write one corpusid slice of the papers into an OpenSearch index, without Prefect."
 RELEASE_HELP = "The release_id that okp s2 pin printed, such as 2026-10-06."
 DATASET_HELP = "Dataset name, such as publication-venues."
 PREFIX_HELP = "Folder in the bucket that every object goes under."
@@ -56,10 +60,23 @@ OPTION_RULES = {
     "from_release": "--from-release must look like 2026-09-29, the release before --release",
 }
 PIN_RULES = {**OPTION_RULES, "release": "--release must be latest or look like 2026-10-06"}
+RANGE_RULE = "--range must look like 1/4: the part to write and the number of equal corpusid parts"
+SEARCH_RULES = {
+    **OPTION_RULES,
+    "index": (
+        "--index must be an OpenSearch index name: lowercase letters, digits, hyphens, "
+        "underscores and dots"
+    ),
+    "part": RANGE_RULE,
+    "parts": RANGE_RULE,
+}
 SETTING_RULES = {
     "OKP_IMAGE_DIGEST": "OKP_IMAGE_DIGEST must be sha256: followed by 64 lowercase hex digits",
     "OKP_S2_API_URL": "OKP_S2_API_URL must be an http or https URL",
     "OKP_CLICKHOUSE_URL": "OKP_CLICKHOUSE_URL must be an http or https URL",
+    "OKP_OPENSEARCH_URL": (
+        "OKP_OPENSEARCH_URL must be an http or https URL without a user or password"
+    ),
 }
 MISSING_KEY = (
     "S2_API_KEY is not set; keep it in ~/.config/openknowledge/.env and run okp through "
@@ -456,6 +473,55 @@ def load_diff(from_release: str, release: str, dataset: str, bucket: str, prefix
     async def run() -> LoadDiffResult:
         async with bootstrap.open_load_service(settings) as service:
             return await bootstrap.load_flows(service, settings).diff(command)
+
+    _run(run)
+
+
+@main.group()
+def search() -> None:
+    """The paper search index."""
+
+
+@search.command("index", help=INDEX_HELP, short_help=INDEX_HELP)
+@click.option(
+    "--index",
+    required=True,
+    help=(
+        "Index name, such as papers-v1; a base pass creates it with the contract's mapping "
+        "when it is missing, a diff pass needs it to exist."
+    ),
+)
+@click.option("--release", required=True, help=RELEASE_HELP)
+@click.option(
+    "--from-release",
+    help="Write only the papers changed since this release, which the index already holds.",
+)
+@click.option(
+    "--range",
+    "corpus_range",
+    default="1/1",
+    show_default=True,
+    metavar="I/N",
+    help="Part I of the corpusid range split into N equal parts.",
+)
+def index(index: str, release: str, from_release: str | None, corpus_range: str) -> None:
+    found = re.fullmatch(r"(\d+)/(\d+)", corpus_range)
+    if found is None:
+        raise click.UsageError(RANGE_RULE)
+    command = _command(
+        IndexPapers,
+        SEARCH_RULES,
+        index=index,
+        release=release,
+        from_release=from_release,
+        part=int(found[1]),
+        parts=int(found[2]),
+    )
+    settings = _settings(SearchSettings)
+
+    async def run() -> BaseModel:
+        async with bootstrap.open_search_service(settings) as service:
+            return await service.index(command)
 
     _run(run)
 

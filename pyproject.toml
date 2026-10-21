@@ -119,6 +119,7 @@ forbidden_modules = [
     "openknowledge_adapters.gcs",
     "openknowledge_adapters.clickhouse",
     "openknowledge_adapters.batch",
+    "openknowledge_adapters.opensearch",
 ]
 
 [[tool.importlinter.contracts]]
@@ -131,6 +132,7 @@ forbidden_modules = [
     "openknowledge_adapters.semantic_scholar",
     "openknowledge_adapters.clickhouse",
     "openknowledge_adapters.batch",
+    "openknowledge_adapters.opensearch",
 ]
 
 [[tool.importlinter.contracts]]
@@ -144,6 +146,7 @@ forbidden_modules = [
     "openknowledge_adapters.gcs",
     "openknowledge_adapters.semantic_scholar",
     "openknowledge_adapters.batch",
+    "openknowledge_adapters.opensearch",
 ]
 
 [[tool.importlinter.contracts]]
@@ -156,6 +159,21 @@ forbidden_modules = [
     "openknowledge_adapters.gcs",
     "openknowledge_adapters.semantic_scholar",
     "openknowledge_adapters.clickhouse",
+    "openknowledge_adapters.opensearch",
+]
+
+[[tool.importlinter.contracts]]
+name = "The OpenSearch adapter imports only its own extra"
+type = "forbidden"
+source_modules = ["openknowledge_adapters.opensearch"]
+forbidden_modules = [
+    "httpx",
+    "google",
+    "gcloud",
+    "openknowledge_adapters.gcs",
+    "openknowledge_adapters.semantic_scholar",
+    "openknowledge_adapters.clickhouse",
+    "openknowledge_adapters.batch",
 ]
 
 [[tool.importlinter.contracts]]

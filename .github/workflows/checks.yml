@@ -73,6 +73,10 @@ jobs:
             extra: batch
             module: openknowledge_adapters.batch
             tests: packages/adapters/tests/batch
+          - package: openknowledge-adapters
+            extra: opensearch
+            module: openknowledge_adapters.opensearch
+            tests: packages/adapters/tests/opensearch
           - package: openknowledge-pipelines
             tests: pipelines/tests
     steps:

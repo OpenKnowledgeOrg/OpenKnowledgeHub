@@ -29,18 +29,27 @@ from openknowledge_core.ingestion import (
     WatchdogResult,
     WatchdogService,
 )
+from openknowledge_core.search import SearchIndexService, SourceRows
 from openknowledge_pipelines import bootstrap, cli, deployments
-from openknowledge_pipelines.settings import LoadSettings, PipelineSettings, WatchdogSettings
+from openknowledge_pipelines.settings import (
+    LoadSettings,
+    PipelineSettings,
+    SearchSettings,
+    WatchdogSettings,
+)
 from tests.fakes.ports import (
     PAPERS,
     PRODUCER,
     RELEASE,
     FakeApplied,
+    FakeSearchSink,
+    FakeSearchSource,
     FakeSource,
     FakeStore,
     FakeTables,
     applied_release,
     clock,
+    paper_row,
 )
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -49,6 +58,11 @@ LOAD_ENV = {
     "OKP_CLICKHOUSE_URL": "http://clickhouse:8123",
     "CLICKHOUSE_PASSWORD": "dev",
     "OKP_CLICKHOUSE_RAW_BUCKET": "raw",
+}
+SEARCH_ENV = {
+    "OKP_OPENSEARCH_URL": "http://opensearch:9200",
+    "OPENSEARCH_PASSWORD": "dev",
+    "OKP_INDEX_SHARDS": "2",
 }
 BATCH_ENV = {
     "S2_API_KEY": "k",
@@ -541,3 +555,34 @@ def test_read_base_cli_without_source_key_or_control_api(
     assert row["source"]["release"] == command.release
     assert row["source"]["object_ref"]["generation"] > 0
     assert store.objects == before
+
+
+def test_search_index_creates_the_index_and_prints_the_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source, sink = FakeSearchSource(), FakeSearchSink()
+    source.base_rows = [SourceRows(corpusid=101, paper=paper_row(101, 41464, title="A Paper"))]
+
+    @asynccontextmanager
+    async def open_search_service(settings: SearchSettings) -> AsyncGenerator[SearchIndexService]:
+        assert settings.opensearch_user == "hub-indexer"
+        yield SearchIndexService(source=source, sink=sink, shards=settings.index_shards)
+
+    monkeypatch.setattr(bootstrap, "open_search_service", open_search_service)
+    monkeypatch.delenv("S2_API_KEY", raising=False)
+    for name, value in {**LOAD_ENV, **SEARCH_ENV}.items():
+        monkeypatch.setenv(name, value)
+    result = CliRunner().invoke(
+        cli.main, ["search", "index", "--index", "papers-v1", "--release", "2026-10-06"]
+    )
+    assert result.exit_code == 0, result.output
+    printed = json.loads(result.output.splitlines()[-1])
+    assert (printed["created"], printed["written"], printed["documents"]) == (True, 1, 1)
+    assert (printed["part"], printed["parts"], printed["from_release"]) == (1, 1, None)
+    assert sink.created["papers-v1"][1]["index"]["number_of_shards"] == 2
+    result = CliRunner().invoke(
+        cli.main,
+        ["search", "index", "--index", "papers-v1", "--release", "2026-10-06", "--range", "3/2"],
+    )
+    assert result.exit_code == 2
+    assert "the part must not exceed the number of parts" in result.output

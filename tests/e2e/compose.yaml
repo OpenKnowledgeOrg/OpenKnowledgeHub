@@ -1,5 +1,6 @@
-# ClickHouse as infra deploy/clickhouse configures it, with the raw bucket on a fake GCS.
-# tests/test_load_e2e.py starts it with free ports in CLICKHOUSE_PORT and GCS_PORT.
+# ClickHouse as infra deploy/clickhouse configures it, with the raw bucket on a fake GCS, and
+# OpenSearch without its security plugin. tests/test_load_e2e.py starts them with free ports in
+# CLICKHOUSE_PORT, GCS_PORT and OPENSEARCH_PORT.
 services:
   clickhouse:
     image: clickhouse/clickhouse-server:26.8.22.13@sha256:110d3d1f8e1ed7e451a6b5d85a16761e948ad43bc2d9ddf10b155964a8b2b40c
@@ -30,3 +31,17 @@ services:
       - -public-host=gcs
     ports:
       - "127.0.0.1:${GCS_PORT:?}:4443"
+
+  opensearch:
+    image: opensearchproject/opensearch:3.9.0@sha256:adfa61f85025d06b4aeb562e7e74fde7e31c437039c93c3862c17e9acebd6c7c
+    environment:
+      discovery.type: single-node
+      DISABLE_SECURITY_PLUGIN: "true"
+      DISABLE_INSTALL_DEMO_CONFIG: "true"
+      OPENSEARCH_JAVA_OPTS: -Xms512m -Xmx512m
+    ports:
+      - "127.0.0.1:${OPENSEARCH_PORT:?}:9200"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9200/_cluster/health"]
+      interval: 2s
+      retries: 60

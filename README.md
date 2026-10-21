@@ -152,6 +152,29 @@ Both texts are fixed so that a log alert can match them.
 Load recovery still needs persisted ownership of a begun load and shared coordination per table.
 Until those are implemented, do not load a base over a populated table with missing lineage or overlap base and diff loads for the same dataset.
 
+## Indexing papers into OpenSearch
+
+```sh
+uv run okp search index --index papers-v1 --release <release_id> [--from-release <release_id>] [--range I/N]
+```
+
+It reads the live rows of `papers` and `abstracts` from ClickHouse and writes one search document per paper into the index, with the abstract when the paper has one.
+A base pass creates the index with the mapping of `packages/contracts/src/openknowledge_contracts/search/papers.py` when it does not exist, and writes into it when it does.
+A diff pass needs the index to exist and stops with exit 1 otherwise.
+Without `--from-release`, every live paper at the release is written.
+With it, only the papers with a newer row in `papers` or `abstracts` are written, and a paper deleted since is deleted from the index.
+`--range I/N` writes part I of the corpusid range split into N equal parts, 1/1 by default.
+The range is the smallest to the largest corpusid at the release, read again by every part, so run all parts of one pass before the next load.
+The rows of a part are read into memory whole, so pick N so that a part fits, and keep 1/1 for small tables.
+The release must be the latest applied. The tables keep no history, so a base pass at an older release does not rebuild that release, it drops every paper whose latest row is newer, can carry an older abstract, and still reports success.
+Each document carries the larger `version` of its two rows, and the writes use `external_gte`, which accepts an equal version again.
+A part can be run again at the same or a newer release. A write below the version the index holds is refused and the pass stops with exit 1.
+It needs `OKP_CLICKHOUSE_URL`, `CLICKHOUSE_PASSWORD`, `OKP_CLICKHOUSE_RAW_BUCKET`, `OKP_OPENSEARCH_URL` and `OPENSEARCH_PASSWORD`.
+Unless set, `OKP_OPENSEARCH_USER` is `hub-indexer`, `OKP_OPENSEARCH_TIMEOUT_SECONDS` is 60 and `OKP_INDEX_SHARDS` is 5.
+An OpenSearch or ClickHouse that cannot be reached ends the run with exit 1 before anything is written.
+`tests/test_search_e2e.py` runs it against ClickHouse and OpenSearch in Docker.
+The flow and the deployment come with the next pull request.
+
 Before a pull request:
 
 ```sh

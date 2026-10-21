@@ -8,7 +8,7 @@ from datetime import UTC, datetime, timedelta
 from importlib.metadata import version
 from typing import TYPE_CHECKING
 
-from openknowledge_adapters import batch, clickhouse, gcs, semantic_scholar
+from openknowledge_adapters import batch, clickhouse, gcs, opensearch, semantic_scholar
 from openknowledge_contracts.manifests import TRANSFORM_VERSION, Producer
 from openknowledge_core.ingestion import (
     DownloadDatasetService,
@@ -22,11 +22,13 @@ from openknowledge_core.ingestion.coordinator import CORE_ORDER, LARGE_ORDER
 from openknowledge_core.ingestion.families import ArchiveFamily
 from openknowledge_core.ingestion.measurement import LoadObservation
 from openknowledge_core.ingestion.ports import LoadTelemetry
+from openknowledge_core.search import SearchIndexService
 from openknowledge_pipelines.settings import (
     BatchSettings,
     CommonSettings,
     LoadSettings,
     PipelineSettings,
+    SearchSettings,
     SyncSettings,
     WatchdogSettings,
 )
@@ -83,6 +85,15 @@ async def open_watchdog(settings: WatchdogSettings) -> AsyncGenerator[WatchdogSe
         yield WatchdogService(applied=ch.applied, clock=lambda: datetime.now(UTC))
 
 
+@asynccontextmanager
+async def open_search_service(settings: SearchSettings) -> AsyncGenerator[SearchIndexService]:
+    async with (
+        clickhouse.connect(_clickhouse(settings, settings.clickhouse_timeout_seconds)) as ch,
+        opensearch.connect(_opensearch(settings)) as sink,
+    ):
+        yield SearchIndexService(source=ch.search, sink=sink, shards=settings.index_shards)
+
+
 def _gcs(settings: CommonSettings) -> gcs.GcsConfig:
     return gcs.GcsConfig(
         request_timeout_seconds=settings.gcs_request_timeout_seconds,
@@ -98,6 +109,15 @@ def _clickhouse(settings: LoadSettings, timeout_seconds: float) -> clickhouse.Cl
         password=settings.clickhouse_password,
         raw_bucket=settings.clickhouse_raw_bucket,
         timeout_seconds=timeout_seconds,
+    )
+
+
+def _opensearch(settings: SearchSettings) -> opensearch.OpenSearchConfig:
+    return opensearch.OpenSearchConfig(
+        url=settings.opensearch_url,
+        user=settings.opensearch_user,
+        password=settings.opensearch_password,
+        timeout_seconds=settings.opensearch_timeout_seconds,
     )
 
 
